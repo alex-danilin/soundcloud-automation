@@ -1,4 +1,5 @@
 import os
+import json
 import datetime
 import logging
 import functions_framework
@@ -8,9 +9,30 @@ from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
 import state_manager
 
-# Configure structured logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# M-14: Custom Cloud Logging Formatter emitting JSON with severity for Cloud Run
+class CloudLoggingFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+        if record.exc_info:
+            log_entry["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+# Configure logging for Cloud Run / Functions Framework
+handler = logging.StreamHandler()
+if os.environ.get("K_SERVICE") or os.environ.get("PORT"):
+    handler.setFormatter(CloudLoggingFormatter())
+else:
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
 logger = logging.getLogger("soundcloud_automation")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(handler)
 
 def _get_gcp_project_id() -> str:
     """Resolves GCP Project ID from env vars or Cloud Run metadata server."""
@@ -40,7 +62,7 @@ def _persist_refreshed_token(new_access_token: str, new_refresh_token: str):
     Callback triggered when SoundCloud issues a new access or rotated refresh token.
     Persists the new refresh token to GCP Secret Manager.
     """
-    logger.info("SoundCloud token refreshed successfully. Updating rotated refresh token.")
+    logger.info("SoundCloud token refreshed successfully. Updating rotated refresh token in Secret Manager.")
     project_id = _get_gcp_project_id()
     secret_id = "soundcloud-refresh-token"
     
@@ -69,7 +91,7 @@ def main(request_obj):
     HTTP Cloud Function / Cloud Run entry point.
     Triggered periodically via GCP Cloud Scheduler or HTTP GET/POST.
     """
-    # 1. M-3: Parse & validate optional lookback minutes parameter with safe exception handling
+    # 1. Parse & validate optional lookback minutes parameter
     lookback = Config.LOOKBACK_MINUTES
     
     if request_obj:
@@ -82,6 +104,11 @@ def main(request_obj):
                 lookback = max(1, min(parsed_val, 10080))
             except (ValueError, TypeError):
                 logger.warning("Invalid lookback_minutes parameter provided: %s", custom_lookback)
+
+    # V-3: Warn prominently if STATE_BUCKET is empty
+    if not Config.STATE_BUCKET:
+        logger.warning("STATE_BUCKET environment variable is empty! Running in fallback mode without GCS persistent state. "
+                       "Tracks will be deduplicated by playlist membership only.")
 
     # 2. Check essential credentials
     if not Config.SOUNDCLOUD_CLIENT_ID or not Config.SOUNDCLOUD_CLIENT_SECRET or not Config.SOUNDCLOUD_REFRESH_TOKEN:
@@ -113,28 +140,29 @@ def main(request_obj):
     # 3. Load state from GCS bucket if configured
     app_state = state_manager.load_state(Config.STATE_BUCKET)
     last_processed_like_id = app_state.get("last_processed_like_id")
-    notified_track_ids = set(app_state.get("notified_track_ids", []))
+
+    # V-2: Preserve insertion order in list for FIFO capping, use set for O(1) membership lookup
+    notified_track_ids = list(app_state.get("notified_track_ids", []))
+    notified_lookup = set(notified_track_ids)
 
     processed_summary = []
-    new_highest_like_id = last_processed_like_id
 
     try:
         # 4. Fetch recent likes (passing state for exact position boundary)
         recent_tracks = sc_client.get_recent_likes(
             lookback_minutes=lookback,
             last_processed_like_id=last_processed_like_id,
-            processed_ids=notified_track_ids
+            processed_ids=notified_lookup
         )
         logger.info("Found %d liked tracks to process.", len(recent_tracks))
+
+        # V-1 FIX: Likes arrive newest-first. The newest liked track in this run is recent_tracks[0]!
+        new_highest_like_id = recent_tracks[0]["id"] if recent_tracks and "id" in recent_tracks[0] else last_processed_like_id
 
         for track in recent_tracks:
             track_id = track.get("id")
             if not track_id:
                 continue
-
-            # Keep track of highest (most recent) liked track ID
-            if new_highest_like_id is None:
-                new_highest_like_id = track_id
 
             track_title = track.get("title", "Unknown Track")
             artist_id = track.get("user", {}).get("id")
@@ -162,7 +190,7 @@ def main(request_obj):
 
             # Action D: Notify Telegram (H-2: ONLY notify if track was newly added and not previously notified)
             telegram_sent = False
-            if playlist_added and track_id not in notified_track_ids:
+            if playlist_added and track_id not in notified_lookup:
                 try:
                     telegram_sent = telegram.send_track_notification(
                         track=track,
@@ -171,7 +199,8 @@ def main(request_obj):
                         musical_key=musical_key
                     )
                     if telegram_sent:
-                        notified_track_ids.add(track_id)
+                        notified_track_ids.append(track_id)
+                        notified_lookup.add(track_id)
                 except Exception as e:
                     logger.error("Error sending Telegram notification for track %s: %s", track_id, e)
 
@@ -188,8 +217,8 @@ def main(request_obj):
 
         # 5. Update state and persist to GCS
         if Config.STATE_BUCKET:
-            app_state["last_processed_like_id"] = new_highest_like_id or last_processed_like_id
-            app_state["notified_track_ids"] = list(notified_track_ids)
+            app_state["last_processed_like_id"] = new_highest_like_id
+            app_state["notified_track_ids"] = notified_track_ids
             app_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             state_manager.save_state(Config.STATE_BUCKET, app_state)
 

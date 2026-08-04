@@ -2,6 +2,11 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
+try:
+    from google.cloud import storage
+except ImportError:
+    storage = None  # Lazy/fallback import if google-cloud-storage is not present in dev
+
 logger = logging.getLogger("soundcloud_automation")
 _STATE_OBJECT_NAME = "state.json"
 
@@ -14,7 +19,10 @@ def load_state(bucket_name: str) -> Dict[str, Any]:
         return {}
 
     try:
-        from google.cloud import storage
+        if storage is None:
+            logger.warning("google-cloud-storage library not available.")
+            return {}
+
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(_STATE_OBJECT_NAME)
@@ -45,7 +53,10 @@ def save_state(bucket_name: str, state: Dict[str, Any]) -> None:
         state["notified_track_ids"] = state["notified_track_ids"][-500:]
 
     try:
-        from google.cloud import storage
+        if storage is None:
+            logger.warning("google-cloud-storage library not available.")
+            return
+
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(_STATE_OBJECT_NAME)

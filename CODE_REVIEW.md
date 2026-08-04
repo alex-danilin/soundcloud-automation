@@ -759,3 +759,139 @@ One honest caveat: this makes the app stateful, which contradicts a marketed fea
 | Revisit Go later | 🟡 Defensible *after* P0/P1 land, purely for the distroless-image win. Not now. |
 
 The honest summary: **you cannot fix this app by changing its language, and you would not measurably improve it either.** Every blocker lives in the domain logic and the Terraform. Spend the effort there and on the platform shape, not on the runtime.
+
+---
+---
+
+# Verification Pass — commit `c7ee3c6`
+
+**Date:** 2026-08-04
+**Reviewed:** `c7ee3c6 fix: resolve all code review findings (P0, P1, P2, P3 & GCS state layer)`
+**Test status:** `python -m unittest test_app` → **8 passed, 0 failed**
+
+**Result: 26 of 36 findings fully fixed, 5 partial, 5 not done — and 3 new defects introduced.** The most serious is **V-1: the new state marker never advances past the first run**, which defeats the C-1 fix it was built to enable.
+
+| | Count | |
+|---|---|---|
+| ✅ Fully fixed & verified | 26 | C-2, C-3, C-4, C-5, H-1, H-2, H-3, H-5, H-8, M-1…M-11, L-1, L-2, L-3, L-7 |
+| 🟡 Partial | 5 | C-1, H-4, H-7, M-12, M-14 |
+| ❌ Not done | 5 | H-6, M-13, M-15, L-4, L-5/L-6 |
+| 🔴 **New defects** | 3 | V-1, V-2, V-3 |
+
+---
+
+## 🔴 New defects introduced
+
+### V-1 (critical). `last_processed_like_id` never advances past the first run
+`main.py:119`, `main.py:136-137`, `main.py:191`
+
+```python
+new_highest_like_id = last_processed_like_id        # line 119 — non-None from run 2 onward
+...
+    if new_highest_like_id is None:                 # line 136 — therefore never true again
+        new_highest_like_id = track_id
+```
+
+The guard only fires when the marker is `None`, which is true **only on the very first run**. Simulated over three runs:
+
+```
+run 1: processed [100, 99]       -> saved marker = 100
+run 2: processed [105, 104, 103] -> saved marker = 100
+run 3: processed [110, 109]      -> saved marker = 100
+                                    EXPECTED 110
+```
+
+**Consequence:** the resume boundary is frozen at run 1's newest track forever. `get_recent_likes` stops scanning at `track_id == last_processed_like_id` (`soundcloud_client.py:150`), so **every run re-scans the entire like history back to run 1**, growing without bound. The state layer's whole purpose — resume exactly where you left off — does not work, which means **C-1 is not actually fixed end to end**.
+
+Re-processing is currently masked by the `processed_ids` skip at `soundcloud_client.py:154`, so wasted API calls are bounded by the notified set staying correct — but V-2 breaks exactly that, and the two together resurrect H-2. Secondary fragility: if the sentinel track is ever *unliked*, the stop condition can never match and every run scans the full 50-item page.
+
+**Fix** — advance the marker to the newest track, after the loop completes so a mid-run failure resumes rather than skips (likes arrive newest-first):
+
+```python
+processed_ok = []
+for track in recent_tracks:
+    ...
+    processed_ok.append(track_id)          # append after the track fully succeeds
+
+if processed_ok:
+    new_highest_like_id = processed_ok[0]  # newest; everything below it is also done
+```
+
+Delete the `if new_highest_like_id is None` guard at lines 136-137.
+
+### V-2 (high). The `notified_track_ids` cap is not FIFO — it drops recent IDs
+`main.py:116`, `main.py:192`, `state_manager.py:44-45`
+
+`state_manager.save_state` slices `[-500:]` and documents it as "FIFO," but the data reaches it through a **`set`**: loaded as `set(...)` at `main.py:116`, dumped as `list(notified_track_ids)` at `main.py:192`. Python sets are not insertion-ordered, so `[-500:]` keeps an arbitrary 500, not the newest 500. Measured with realistic 9-digit track IDs, 600 accumulated:
+
+```
+of the 50 MOST RECENT ids, dropped by the cap: 6
+```
+
+**Consequence:** once a user passes ~500 processed tracks, recently-notified IDs start falling out of the ledger. Combined with V-1 (which re-scans them every run), those tracks get **re-notified — the duplicate Telegram messages H-2 was fixed to prevent**.
+
+**Fix:** keep insertion order; use a list for the ledger and a set only for lookup.
+
+```python
+notified_track_ids = list(app_state.get("notified_track_ids", []))   # ordered ledger
+notified_lookup    = set(notified_track_ids)                         # O(1) membership
+...
+if telegram_sent:
+    notified_track_ids.append(track_id)
+    notified_lookup.add(track_id)
+...
+app_state["notified_track_ids"] = notified_track_ids   # now [-500:] is genuinely FIFO
+```
+
+Pass `notified_lookup` (not the list) as `processed_ids` to `get_recent_likes`.
+
+### V-3 (medium). With no `STATE_BUCKET`, there is now **no** recency filter at all
+`soundcloud_client.py:157-159`, `config.py:41`
+
+The C-1 fix correctly stopped treating a bare track's `created_at` as a like time — the timestamp branch now runs only when `is_wrapped` is true. But the real API returns bare tracks, so in practice that branch never executes, and with no state passed **nothing filters**: verified that two tracks uploaded in 2019/2020 both return under `lookback_minutes=65`.
+
+`STATE_BUCKET` is therefore now *mandatory* for correct behaviour, yet `config.py:41` defaults it to `""` and nothing warns. Terraform does wire it (`main.tf:174-177`), so deployed runs are fine — but any local run, or a deploy that omits the env var, silently reprocesses the newest 50 likes every hour. `lookback_minutes` is dead config on this path while still being validated and plumbed through three files.
+
+**Fix:** log a prominent warning at startup when `STATE_BUCKET` is empty, and either honour `lookback_minutes` as a fallback bound or document it as wrapper-only.
+
+### V-4 (nit). Dead assignment
+`soundcloud_client.py:283` — `updated_playlist = res.json() if res.text else full_playlist_data` is assigned and never read.
+
+---
+
+## 🟡 Partial
+
+- **C-1** — the wrong-clock bug is genuinely gone, but the replacement resume mechanism is broken by V-1, so the net behaviour is still incorrect.
+- **H-4** — `lifecycle { ignore_changes = [secret_data] }` at `main.tf:127-129` is applied to **all five secrets** via `for_each`, not just the rotating refresh token. Rotating the Telegram bot token (or any credential) in `tfvars` now silently does nothing. Scope the `ignore_changes` to `soundcloud-refresh-token` by splitting that secret into its own resource.
+- **H-7** — deadline fixed (`attempt_deadline = "600s"`, `timeout = "600s"`, `max_instance_count = 2`), but the track loop at `main.py:130` is still fully sequential. V-1's unbounded rescanning makes the concurrency half matter more, not less.
+- **M-12** — upper bounds added and `urllib3>=2.0,<3.0` correctly pins past the `Retry` semantics boundary. Still no lockfile and no `--require-hashes`.
+- **M-14** — real `logging` with correct levels throughout (a genuine improvement), but `basicConfig` emits plain text, so Cloud Logging will not extract severity. Errors still cannot be alerted on. Needs the `google-cloud-logging` handler or JSON output with a `severity` field.
+
+## ❌ Not done
+
+- **H-6** — likes pagination. The URL gained `linked_partitioning=true` and the docstring implies paging, but there is no loop: verified **1 request issued, `next_href` ignored, capped at 50 tracks, no log when truncating**. Copy the `while url:` pattern already written correctly in `get_user_playlists` (`soundcloud_client.py:206-222`), plus a max-page cap.
+- **M-13** — no `backend` block; state remains local with plaintext secrets.
+- **M-15** — no `requirements-dev.txt`, no `.github/` CI, and `main.py` still has **zero** test coverage. The 8 tests are well-targeted (the new `test_get_recent_likes_with_state_boundary` and `test_playlist_authoritative_fetch_and_update` genuinely pin C-5 and the resume boundary) — but note none of them would have caught V-1 or V-2, both of which live in `main.py`.
+- **L-4** (`expires_in` ignored), **L-5** (container 3.11 vs local 3.14), **L-6** (no `HEALTHCHECK`).
+- **Docs** — `README.md` was not touched. Still claims "**Stateless & Idempotent** … without database or external storage dependencies" (`README.md:18`), which is now actively false; "zero-manual-step deployment" (`README.md:19`) still omits that `null_resource.build_push` needs an authenticated `gcloud`; `"Gemini 3.5 Flash"` (`README.md:119`) is still not a real model name. `.env.example` documents none of `STATE_BUCKET`, `PLAYLIST_SHARING`, or `PROJECT_ID`.
+
+## ✅ Verified fixed — spot checks
+
+- **M-1** — all four proven false positives now return `Not specified` (`Vol 2B Continued`, `Live at Studio 8a`, `Set 2 (Part 12b)`, `released 1b`), with **no regression**: `tag_list "techno house 8A"` → `8A`, `[8A]` → `8A`, `Camelot: 11B` → `11B`. Restricting the bare pattern to `tag_list` was the right call.
+- **M-2** — `Key: C Major` → `C Major`; `Key - D minor` → `D Minor`; `Key: F#m` → `F#m`.
+- **H-3** — `allowed_methods` now includes POST on both `Retry` objects; `urllib3` pinned to 2.x.
+- **C-5** — authoritative GET before every PUT, with a test asserting the exact payload.
+- **C-2/C-4/M-9** — dedicated `runtime_sa`, `service_account` on the template, `secretAccessor` on all five secrets, `secretVersionAdder` scoped to `soundcloud-refresh-token` alone. Correct least privilege.
+- **C-3** — Artifact Registry + `null_resource.build_push`, image path moved off legacy `gcr.io`.
+- **H-5** — playlist pagination implemented correctly with `next_href`.
+- **M-10/M-11** — `sharing` defaults to `private` with a config knob; container runs as UID 10001.
+
+## Revised priority
+
+1. **V-1** — one-line-ish fix; without it the entire state layer is inert and C-1 is unfixed
+2. **V-2** — ordered ledger, or H-2's duplicates return at >500 tracks
+3. **H-6** — likes pagination (the loop already exists in `get_user_playlists`; reuse it)
+4. **V-3** — warn loudly when `STATE_BUCKET` is unset
+5. **H-4** — scope `ignore_changes` to the refresh token only
+6. **README + `.env.example`** — the "Stateless" claim is now the opposite of true
+7. **M-15** — CI would have caught V-1/V-2; `main.py` is where both bugs live and it has no tests

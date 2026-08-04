@@ -46,7 +46,6 @@ class SoundCloudClient:
         )
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
-        # L-2: Mounted only https:// (SoundCloud API is HTTPS only)
 
     def ensure_access_token(self, force_refresh: bool = False) -> str:
         """Obtains or refreshes the SoundCloud OAuth access token."""
@@ -115,66 +114,75 @@ class SoundCloudClient:
         """
         Fetches recently liked tracks.
         Likes are returned in reverse chronological order (most recently liked first).
+        Paginates up to max_pages (default 10 pages / 500 tracks) following next_href.
         If last_processed_like_id or processed_ids is provided, stops scanning once seen likes are reached.
-        Otherwise, filters based on like-event wrapper timestamp or lookback boundary.
         """
-        url = f"{self.BASE_URL}/me/likes/tracks?limit=50&linked_partitioning=true"
-        
-        response = self._make_request("GET", url, timeout=15)
-        if not response.ok:
-            raise RuntimeError(f"Error fetching SoundCloud likes: {response.status_code} - {response.text}")
-
-        data = response.json()
-        items = data.get("collection", data) if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            items = []
-        
+        url: Optional[str] = f"{self.BASE_URL}/me/likes/tracks?limit=50&linked_partitioning=true"
         cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)
         recent_tracks = []
         stop_scanning = False
+        page_count = 0
+        max_pages = 10
 
-        for item in items:
-            if stop_scanning:
-                break
+        while url and not stop_scanning and page_count < max_pages:
+            page_count += 1
+            response = self._make_request("GET", url, timeout=15)
+            if not response.ok:
+                raise RuntimeError(f"Error fetching SoundCloud likes: {response.status_code} - {response.text}")
 
-            # Handle both wrapped items {"created_at": ..., "track": {...}} and bare track objects
-            is_wrapped = isinstance(item, dict) and "track" in item and isinstance(item["track"], dict)
-            track = item["track"] if is_wrapped else item
-            
-            if not isinstance(track, dict) or "id" not in track:
-                continue
+            data = response.json()
+            if isinstance(data, dict):
+                items = data.get("collection", [])
+                url = data.get("next_href")
+            elif isinstance(data, list):
+                items = data
+                url = None
+            else:
+                items = []
+                url = None
 
-            track_id = track.get("id")
+            for item in items:
+                if stop_scanning:
+                    break
 
-            # 1. State-based deduplication: stop if we hit the last processed track ID or an already processed ID
-            if last_processed_like_id and track_id == last_processed_like_id:
-                stop_scanning = True
-                break
-
-            if processed_ids and track_id in processed_ids:
-                continue
-
-            # 2. Recency time check: ONLY use item["created_at"] if item is a like-event wrapper!
-            # If item is a bare track object, item["created_at"] is track UPLOAD time, not like time.
-            if is_wrapped and "created_at" in item:
-                created_at_str = item["created_at"]
-                try:
-                    dt_str = str(created_at_str).replace("/", "-").replace(" +0000", "+00:00")
-                    if dt_str.endswith("Z"):
-                        dt_str = dt_str[:-1] + "+00:00"
-                    
-                    liked_dt = datetime.datetime.fromisoformat(dt_str)
-                    if liked_dt.tzinfo is None:
-                        liked_dt = liked_dt.replace(tzinfo=datetime.timezone.utc)
-                    
-                    if liked_dt < cutoff_time:
-                        stop_scanning = True
-                        break
-                except Exception as parse_err:
-                    logger.warning("Could not parse like timestamp '%s': %s", created_at_str, parse_err)
+                # Handle both wrapped items {"created_at": ..., "track": {...}} and bare track objects
+                is_wrapped = isinstance(item, dict) and "track" in item and isinstance(item["track"], dict)
+                track = item["track"] if is_wrapped else item
+                
+                if not isinstance(track, dict) or "id" not in track:
                     continue
 
-            recent_tracks.append(track)
+                track_id = track.get("id")
+
+                # 1. State-based deduplication: stop if we hit the last processed track ID
+                if last_processed_like_id and track_id == last_processed_like_id:
+                    stop_scanning = True
+                    break
+
+                if processed_ids and track_id in processed_ids:
+                    continue
+
+                # 2. Recency time check: ONLY use item["created_at"] if item is a like-event wrapper!
+                # If item is a bare track object, item["created_at"] is track UPLOAD time, not like time.
+                if is_wrapped and "created_at" in item:
+                    created_at_str = item["created_at"]
+                    try:
+                        dt_str = str(created_at_str).replace("/", "-").replace(" +0000", "+00:00")
+                        if dt_str.endswith("Z"):
+                            dt_str = dt_str[:-1] + "+00:00"
+                        
+                        liked_dt = datetime.datetime.fromisoformat(dt_str)
+                        if liked_dt.tzinfo is None:
+                            liked_dt = liked_dt.replace(tzinfo=datetime.timezone.utc)
+                        
+                        if liked_dt < cutoff_time:
+                            stop_scanning = True
+                            break
+                    except Exception as parse_err:
+                        logger.warning("Could not parse like timestamp '%s': %s", created_at_str, parse_err)
+                        continue
+
+                recent_tracks.append(track)
 
         return recent_tracks
 
@@ -200,7 +208,7 @@ class SoundCloudClient:
         if self._playlists_cache is not None and not force_refresh:
             return self._playlists_cache
 
-        url = f"{self.BASE_URL}/me/playlists?limit=50&linked_partitioning=true"
+        url: Optional[str] = f"{self.BASE_URL}/me/playlists?limit=50&linked_partitioning=true"
         all_playlists = []
 
         while url:
@@ -279,8 +287,7 @@ class SoundCloudClient:
             if not res.ok:
                 raise RuntimeError(f"Failed to update playlist '{playlist_title}': {res.status_code} - {res.text}")
             
-            # Update cache in-place with authoritative updated data
-            updated_playlist = res.json() if res.text else full_playlist_data
+            # V-4: Update cache in-place with authoritative updated data (removed dead variable assignment)
             target_playlist["tracks"] = existing_tracks + [{"id": track_id}]
             
             if self._playlists_cache is not None:
@@ -361,7 +368,7 @@ class SoundCloudClient:
             return raw_key.capitalize()
 
         pitch_bracket_match = re.search(
-            r'[\(\[]([A-G][#b]?(?:\s*(?:m|min|maj|minor|major))?)[\)\]]',
+            r'[\(\[]([A-G][#b]?(?:\s*(?:m|min|maj|minor|major)?))[\)\]]',
             combined_text,
             re.IGNORECASE
         )

@@ -3,6 +3,7 @@ import datetime
 from unittest.mock import MagicMock, patch
 from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
+import state_manager
 
 class TestSoundCloudClient(unittest.TestCase):
 
@@ -56,7 +57,6 @@ class TestSoundCloudClient(unittest.TestCase):
     def test_get_recent_likes_with_state_boundary(self, mock_make_request):
         mock_resp = MagicMock()
         mock_resp.ok = True
-        # Real SoundCloud API returns bare track objects or collection items
         mock_resp.json.return_value = {
             "collection": [
                 {"id": 100, "title": "Track 100"},
@@ -80,12 +80,10 @@ class TestSoundCloudClient(unittest.TestCase):
             {"id": 500, "title": "Genre: Techno", "tracks": []}
         ]
 
-        # First call fetches authoritative tracks from GET /playlists/500
         get_pl_resp = MagicMock()
         get_pl_resp.ok = True
         get_pl_resp.json.return_value = {"id": 500, "title": "Genre: Techno", "tracks": [101, 102]}
 
-        # Second call PUTs updated playlist
         put_pl_resp = MagicMock()
         put_pl_resp.ok = True
 
@@ -95,7 +93,6 @@ class TestSoundCloudClient(unittest.TestCase):
         self.assertEqual(title, "Genre: Techno")
         self.assertTrue(added)
 
-        # Verify calls
         self.assertEqual(mock_make_request.call_count, 2)
         put_call_args = mock_make_request.call_args_list[1]
         payload = put_call_args[1]["json"]
@@ -121,6 +118,27 @@ class TestSoundCloudClient(unittest.TestCase):
             self.assertIn("https://soundcloud.com/artist/track?param=1&amp;other=2", sent_text)
             self.assertIn("Artist &lt;One&gt;", sent_text)
             self.assertIn("ℹ️ Already Following", sent_text)
+
+    def test_state_manager_fifo_capping(self):
+        state = {
+            "last_processed_like_id": 1000,
+            "notified_track_ids": list(range(1, 601))  # 600 items in order 1..600
+        }
+        mock_storage = MagicMock()
+        mock_blob = MagicMock()
+        mock_storage.Client.return_value.bucket.return_value.blob.return_value = mock_blob
+
+        with patch.object(state_manager, "storage", mock_storage):
+            state_manager.save_state("test-bucket", state)
+            self.assertTrue(mock_blob.upload_from_string.called)
+            
+            uploaded_json = mock_blob.upload_from_string.call_args[0][0]
+            import json
+            saved_data = json.loads(uploaded_json)
+            # Must keep the NEWEST 500 (101 to 600) in insertion order
+            self.assertEqual(len(saved_data["notified_track_ids"]), 500)
+            self.assertEqual(saved_data["notified_track_ids"][0], 101)
+            self.assertEqual(saved_data["notified_track_ids"][-1], 600)
 
 if __name__ == "__main__":
     unittest.main()

@@ -98,17 +98,25 @@ resource "google_storage_bucket_iam_member" "state_rw" {
 
 # 5. Secret Manager Resources
 locals {
-  secrets_map = {
+  static_secrets_map = {
     "soundcloud-client-id"     = var.soundcloud_client_id
     "soundcloud-client-secret" = var.soundcloud_client_secret
-    "soundcloud-refresh-token" = var.soundcloud_refresh_token
     "telegram-bot-token"        = var.telegram_bot_token
     "telegram-chat-id"          = var.telegram_chat_id
   }
+
+  all_secret_ids = [
+    "soundcloud-client-id",
+    "soundcloud-client-secret",
+    "soundcloud-refresh-token",
+    "telegram-bot-token",
+    "telegram-chat-id"
+  ]
 }
 
-resource "google_secret_manager_secret" "secrets" {
-  for_each  = local.secrets_map
+# Create Secret containers for all secrets
+resource "google_secret_manager_secret" "all_secrets" {
+  for_each  = toset(local.all_secret_ids)
   secret_id = each.key
 
   replication {
@@ -118,12 +126,18 @@ resource "google_secret_manager_secret" "secrets" {
   depends_on = [google_project_service.apis]
 }
 
-resource "google_secret_manager_secret_version" "versions" {
-  for_each    = local.secrets_map
-  secret      = google_secret_manager_secret.secrets[each.key].id
+# Standard secret versions (updates when tfvars changes)
+resource "google_secret_manager_secret_version" "static_versions" {
+  for_each    = local.static_secrets_map
+  secret      = google_secret_manager_secret.all_secrets[each.key].id
   secret_data = each.value
+}
 
-  # H-4: Do not clobber rotated live refresh tokens on subsequent terraform apply
+# H-4 FIX: Scoped lifecycle ignore_changes ONLY for the auto-rotating refresh token
+resource "google_secret_manager_secret_version" "refresh_token_version" {
+  secret      = google_secret_manager_secret.all_secrets["soundcloud-refresh-token"].id
+  secret_data = var.soundcloud_refresh_token
+
   lifecycle {
     ignore_changes = [secret_data]
   }
@@ -131,14 +145,14 @@ resource "google_secret_manager_secret_version" "versions" {
 
 # Grant Runtime SA Secret Manager Access (C-2, C-4)
 resource "google_secret_manager_secret_iam_member" "accessor" {
-  for_each  = local.secrets_map
-  secret_id = google_secret_manager_secret.secrets[each.key].secret_id
+  for_each  = toset(local.all_secret_ids)
+  secret_id = google_secret_manager_secret.all_secrets[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.runtime_sa.email}"
 }
 
 resource "google_secret_manager_secret_iam_member" "refresh_token_version_adder" {
-  secret_id = google_secret_manager_secret.secrets["soundcloud-refresh-token"].secret_id
+  secret_id = google_secret_manager_secret.all_secrets["soundcloud-refresh-token"].secret_id
   role      = "roles/secretmanager.secretVersionAdder"
   member    = "serviceAccount:${google_service_account.runtime_sa.email}"
 }
@@ -197,7 +211,7 @@ resource "google_cloud_run_v2_service" "default" {
         name = "SOUNDCLOUD_CLIENT_ID"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.secrets["soundcloud-client-id"].secret_id
+            secret  = google_secret_manager_secret.all_secrets["soundcloud-client-id"].secret_id
             version = "latest"
           }
         }
@@ -206,7 +220,7 @@ resource "google_cloud_run_v2_service" "default" {
         name = "SOUNDCLOUD_CLIENT_SECRET"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.secrets["soundcloud-client-secret"].secret_id
+            secret  = google_secret_manager_secret.all_secrets["soundcloud-client-secret"].secret_id
             version = "latest"
           }
         }
@@ -215,7 +229,7 @@ resource "google_cloud_run_v2_service" "default" {
         name = "SOUNDCLOUD_REFRESH_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.secrets["soundcloud-refresh-token"].secret_id
+            secret  = google_secret_manager_secret.all_secrets["soundcloud-refresh-token"].secret_id
             version = "latest"
           }
         }
@@ -224,7 +238,7 @@ resource "google_cloud_run_v2_service" "default" {
         name = "TELEGRAM_BOT_TOKEN"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.secrets["telegram-bot-token"].secret_id
+            secret  = google_secret_manager_secret.all_secrets["telegram-bot-token"].secret_id
             version = "latest"
           }
         }
@@ -233,7 +247,7 @@ resource "google_cloud_run_v2_service" "default" {
         name = "TELEGRAM_CHAT_ID"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.secrets["telegram-chat-id"].secret_id
+            secret  = google_secret_manager_secret.all_secrets["telegram-chat-id"].secret_id
             version = "latest"
           }
         }
@@ -243,7 +257,8 @@ resource "google_cloud_run_v2_service" "default" {
 
   depends_on = [
     google_project_service.apis,
-    google_secret_manager_secret_version.versions,
+    google_secret_manager_secret_version.static_versions,
+    google_secret_manager_secret_version.refresh_token_version,
     google_secret_manager_secret_iam_member.accessor,
     null_resource.build_push
   ]
