@@ -23,10 +23,11 @@ class SoundCloudClient:
         self.access_token = access_token
         self.playlist_prefix = playlist_prefix
         self.default_genre = default_genre
+        self._playlists_cache: Optional[List[Dict[str, Any]]] = None
 
-    def ensure_access_token(self) -> str:
+    def ensure_access_token(self, force_refresh: bool = False) -> str:
         """Obtains or refreshes the SoundCloud OAuth access token."""
-        if self.access_token:
+        if self.access_token and not force_refresh:
             return self.access_token
 
         if not self.refresh_token or not self.client_id or not self.client_secret:
@@ -60,19 +61,33 @@ class SoundCloudClient:
             "Content-Type": "application/json"
         }
 
+    def _make_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Executes HTTP request with automatic single retry on 401 Unauthorized via token refresh."""
+        headers = kwargs.pop("headers", None)
+        if headers is None:
+            headers = self._get_headers()
+
+        response = requests.request(method, url, headers=headers, **kwargs)
+        if response.status_code == 401 and self.refresh_token:
+            # Token expired; force refresh and retry once
+            token = self.ensure_access_token(force_refresh=True)
+            headers["Authorization"] = f"OAuth {token}"
+            response = requests.request(method, url, headers=headers, **kwargs)
+
+        return response
+
     def get_recent_likes(self, lookback_minutes: int = 65) -> List[Dict[str, Any]]:
         """
         Fetches recently liked tracks within the specified lookback window.
         Filters tracks based on the 'created_at' timestamp of the like event.
         """
-        headers = self._get_headers()
         url = f"{self.BASE_URL}/me/likes/tracks?limit=50"
         
-        response = requests.get(url, headers=headers, timeout=15)
+        response = self._make_request("GET", url, timeout=15)
         if not response.ok:
             # Fallback to alternate endpoint if /me/likes/tracks returns error
             url = f"{self.BASE_URL}/me/favorites?limit=50"
-            response = requests.get(url, headers=headers, timeout=15)
+            response = self._make_request("GET", url, timeout=15)
             if not response.ok:
                 raise RuntimeError(f"Error fetching SoundCloud likes: {response.status_code} - {response.text}")
 
@@ -91,15 +106,18 @@ class SoundCloudClient:
             created_at_str = item.get("created_at") or track.get("created_at")
             if created_at_str:
                 try:
-                    # Clean ISO format string (e.g. 2026-08-03T20:15:30Z or 2026/08/03 20:15:30 +0000)
-                    dt_str = created_at_str.replace("/", "-").replace(" +0000", "Z")
-                    liked_dt = datetime.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    dt_str = str(created_at_str).replace("/", "-").replace(" +0000", "+00:00")
+                    if dt_str.endswith("Z"):
+                        dt_str = dt_str[:-1] + "+00:00"
+                    
+                    liked_dt = datetime.datetime.fromisoformat(dt_str)
+                    if liked_dt.tzinfo is None:
+                        liked_dt = liked_dt.replace(tzinfo=datetime.timezone.utc)
                     
                     if liked_dt < cutoff_time:
                         continue
-                except Exception:
-                    # If parsing fails, keep track to be safe
-                    pass
+                except Exception as parse_err:
+                    print(f"Warning: Could not parse timestamp '{created_at_str}': {parse_err}")
 
             recent_tracks.append(track)
 
@@ -110,29 +128,32 @@ class SoundCloudClient:
         Follows the specified artist by user ID on SoundCloud.
         Idempotent: Following an already followed artist succeeds gracefully.
         """
-        headers = self._get_headers()
         url = f"{self.BASE_URL}/me/followings/{artist_id}"
         
-        response = requests.put(url, headers=headers, timeout=15)
+        response = self._make_request("PUT", url, timeout=15)
         if response.status_code in (200, 201, 204):
             return True
         
         # Fallback endpoint
         alt_url = f"{self.BASE_URL}/users/{artist_id}/follow"
-        alt_resp = requests.post(alt_url, headers=headers, timeout=15)
+        alt_resp = self._make_request("POST", alt_url, timeout=15)
         return alt_resp.status_code in (200, 201, 204)
 
-    def get_user_playlists(self) -> List[Dict[str, Any]]:
-        """Retrieves the authenticated user's existing playlists."""
-        headers = self._get_headers()
+    def get_user_playlists(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Retrieves the authenticated user's existing playlists with caching."""
+        if self._playlists_cache is not None and not force_refresh:
+            return self._playlists_cache
+
         url = f"{self.BASE_URL}/me/playlists"
         
-        response = requests.get(url, headers=headers, timeout=15)
+        response = self._make_request("GET", url, timeout=15)
         if not response.ok:
             return []
         
         data = response.json()
-        return data if isinstance(data, list) else data.get("collection", [])
+        playlists = data if isinstance(data, list) else data.get("collection", [])
+        self._playlists_cache = playlists
+        return playlists
 
     def add_track_to_genre_playlist(self, track: Dict[str, Any], genre: str) -> Tuple[str, bool]:
         """
@@ -151,11 +172,21 @@ class SoundCloudClient:
                 target_playlist = pl
                 break
 
-        headers = self._get_headers()
-
         if target_playlist:
             playlist_id = target_playlist.get("id")
-            existing_tracks = target_playlist.get("tracks", [])
+            existing_tracks = target_playlist.get("tracks")
+            
+            # If summary object did not include full tracks array, fetch playlist details
+            if existing_tracks is None and playlist_id:
+                pl_resp = self._make_request("GET", f"{self.BASE_URL}/playlists/{playlist_id}", timeout=15)
+                if pl_resp.ok:
+                    target_playlist = pl_resp.json()
+                    existing_tracks = target_playlist.get("tracks", [])
+                else:
+                    existing_tracks = []
+            elif existing_tracks is None:
+                existing_tracks = []
+
             existing_ids = [t.get("id") for t in existing_tracks if isinstance(t, dict) and "id" in t]
 
             if track_id in existing_ids:
@@ -167,10 +198,11 @@ class SoundCloudClient:
             payload = {"playlist": {"tracks": updated_track_objs}}
             
             update_url = f"{self.BASE_URL}/playlists/{playlist_id}"
-            res = requests.put(update_url, json=payload, headers=headers, timeout=15)
+            res = self._make_request("PUT", update_url, json=payload, timeout=15)
             if not res.ok:
                 raise RuntimeError(f"Failed to update playlist '{playlist_title}': {res.status_code} - {res.text}")
             
+            self._playlists_cache = None
             return playlist_title, True
         else:
             # Create new playlist with track
@@ -182,14 +214,15 @@ class SoundCloudClient:
                 }
             }
             create_url = f"{self.BASE_URL}/playlists"
-            res = requests.post(create_url, json=payload, headers=headers, timeout=15)
+            res = self._make_request("POST", create_url, json=payload, timeout=15)
             if not res.ok:
                 # Try fallback create endpoint
                 create_url = f"{self.BASE_URL}/me/playlists"
-                res = requests.post(create_url, json=payload, headers=headers, timeout=15)
+                res = self._make_request("POST", create_url, json=payload, timeout=15)
                 if not res.ok:
                     raise RuntimeError(f"Failed to create playlist '{playlist_title}': {res.status_code} - {res.text}")
 
+            self._playlists_cache = None
             return playlist_title, True
 
     @staticmethod
@@ -211,11 +244,10 @@ class SoundCloudClient:
         if camelot_match:
             return camelot_match.group(0).upper()
 
-        # 3. Check for standard musical keys (e.g. C#m, D minor, F-sharp major, Am)
-        key_pattern = r'\b([A-G][#b]?(?:m|min|maj|minor|major)?)\b'
-        # Explicit key label match, e.g. "Key: Am" or "Key - C#m"
+        # 3. Check for standard musical keys (e.g. Key: Am or Key - C#m)
         key_label_match = re.search(r'\bkey[:\s\-]+([A-G][#b]?(?:m|min|maj|minor|major)?)\b', combined_text, re.IGNORECASE)
         if key_label_match:
             return key_label_match.group(1).capitalize()
 
         return "Not specified"
+

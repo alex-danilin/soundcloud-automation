@@ -30,6 +30,9 @@ def main(request_obj):
             "message": "SoundCloud API credentials (client_id, client_secret, refresh_token) are missing."
         }), 500
 
+    if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
+        print("Warning: Telegram credentials missing. Notifications will be skipped.")
+
     sc_client = SoundCloudClient(
         client_id=Config.SOUNDCLOUD_CLIENT_ID,
         client_secret=Config.SOUNDCLOUD_CLIENT_SECRET,
