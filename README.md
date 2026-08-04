@@ -125,4 +125,4 @@ Looking to contribute or enhance this repository? Here are great feature ideas:
 
 ## 📜 License
 
-This project is licensed under the **PolyForm Noncommercial License 1.0.0** — free for personal and non-commercial use. Commercial use requires a commercial license agreement. See [`LICENSE`](LICENSE) for details.
+This project is licensed under the **MIT License** — see the [`LICENSE`](LICENSE) file for details.
