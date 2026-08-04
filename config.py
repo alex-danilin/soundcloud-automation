@@ -1,9 +1,10 @@
 import os
 import logging
-from dotenv import load_dotenv
-
-# Load local .env file if available (useful for local development)
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 def _parse_int(val: str, default: int) -> int:
     try:

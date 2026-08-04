@@ -2,8 +2,26 @@ import os
 import json
 import datetime
 import logging
-import functions_framework
-from flask import jsonify
+try:
+    import functions_framework
+except ImportError:
+    class DummyFunctionsFramework:
+        @staticmethod
+        def http(func):
+            return func
+    functions_framework = DummyFunctionsFramework()
+try:
+    from flask import jsonify, Flask, request as flask_request
+except ImportError:
+    import json
+    def jsonify(data, status_code=200):
+        return json.dumps(data), status_code
+    class Flask:
+        def __init__(self, name): pass
+        def route(self, *args, **kwargs):
+            return lambda f: f
+        def run(self, *args, **kwargs): pass
+    flask_request = None
 from config import Config
 from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
@@ -156,7 +174,7 @@ def main(request_obj):
         )
         logger.info("Found %d liked tracks to process.", len(recent_tracks))
 
-        # V-1 FIX: Likes arrive newest-first. The newest liked track in this run is recent_tracks[0]!
+        run_had_failures = False
         new_highest_like_id = recent_tracks[0]["id"] if recent_tracks and "id" in recent_tracks[0] else last_processed_like_id
 
         for track in recent_tracks:
@@ -184,6 +202,7 @@ def main(request_obj):
                 playlist_title, playlist_added = sc_client.add_track_to_genre_playlist(track, genre)
             except Exception as e:
                 logger.error("Error adding track %s to genre playlist: %s", track_id, e)
+                run_had_failures = True
 
             # Action C: Extract musical key signature
             musical_key = sc_client.extract_musical_key(track)
@@ -201,8 +220,11 @@ def main(request_obj):
                     if telegram_sent:
                         notified_track_ids.append(track_id)
                         notified_lookup.add(track_id)
+                    else:
+                        run_had_failures = True
                 except Exception as e:
                     logger.error("Error sending Telegram notification for track %s: %s", track_id, e)
+                    run_had_failures = True
 
             processed_summary.append({
                 "track_id": track_id,
@@ -217,7 +239,11 @@ def main(request_obj):
 
         # 5. Update state and persist to GCS
         if Config.STATE_BUCKET:
-            app_state["last_processed_like_id"] = new_highest_like_id
+            if not run_had_failures:
+                app_state["last_processed_like_id"] = new_highest_like_id
+            else:
+                logger.warning("Run encountered processing errors. Keeping last_processed_like_id at %s to allow retrying failed tracks on next run.", last_processed_like_id)
+
             app_state["notified_track_ids"] = notified_track_ids
             app_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             state_manager.save_state(Config.STATE_BUCKET, app_state)

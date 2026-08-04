@@ -184,6 +184,9 @@ class SoundCloudClient:
 
                 recent_tracks.append(track)
 
+        if url and page_count >= max_pages and not stop_scanning:
+            logger.warning("Reached max_pages limit (%d) when fetching SoundCloud likes. Some older likes were not scanned.", max_pages)
+
         return recent_tracks
 
     def follow_artist(self, artist_id: int) -> str:

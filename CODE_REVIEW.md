@@ -895,3 +895,78 @@ The C-1 fix correctly stopped treating a bare track's `created_at` as a like tim
 5. **H-4** — scope `ignore_changes` to the refresh token only
 6. **README + `.env.example`** — the "Stateless" claim is now the opposite of true
 7. **M-15** — CI would have caught V-1/V-2; `main.py` is where both bugs live and it has no tests
+
+---
+---
+
+# Verification Pass 2 — commit `3fdc233`
+
+**Date:** 2026-08-04
+**Reviewed:** `3fdc233 fix: resolve verification pass defects (V-1, V-2, V-3, H-6, H-4 & JSON logging)`
+**Test status:** `python -m unittest test_app` → **9 passed, 0 failed** (new: `test_state_manager_fifo_capping`)
+**Infra status:** `terraform validate` → **Success. The configuration is valid.**
+
+**Result: all four V-defects fixed and verified. 28 of 36 original findings now fully resolved.** One new medium-severity residual emerges as a direct consequence of fixing V-1 correctly.
+
+| | Count | |
+|---|---|---|
+| ✅ Fully fixed & verified | 28 | C-1…C-5, H-1…H-6, H-8, M-1…M-11, M-14, L-1, L-2, L-3, L-7 |
+| 🟡 Partial | 2 | H-7 (deadline yes, concurrency no), M-12 (bounds, no hashes) |
+| ❌ Not done | 5 | M-13, M-15, L-4, L-5, L-6 |
+| ⚪ Accepted as-is | 1 | L-8 (IAM-protected ingress) |
+| 🔴 New residual | 1 | V-5 |
+
+## ✅ Verified fixed this pass
+
+- **V-1** — marker now advances: `100 → 105 → 110`, and correctly holds at `110` on an empty run. `main.py:160` takes `recent_tracks[0]["id"]` (likes are newest-first), and because the save at `main.py:219-223` sits inside the `try`, a whole-run exception leaves the marker untouched. Correct ordering.
+- **V-2** — the ledger is a list end-to-end (`main.py:145-146`) with a parallel set for O(1) lookup. Verified: 600 IDs capped to 500 drops exactly the **100 oldest**, and **zero** of the 50 most recent. Genuinely FIFO now, and there is a test pinning it.
+- **V-3** — prominent warning at `main.py:109-111` when `STATE_BUCKET` is empty.
+- **V-4** — dead `updated_playlist` assignment removed.
+- **H-6** — pagination implemented. Verified: 3 requests issued following `next_href` (was 1), and an infinite `next_href` correctly stops at the `max_pages = 10` ceiling rather than looping forever.
+- **H-4** — properly scoped, and the refactor is clean. Secrets split into `static_versions` (four credentials, update normally from `tfvars`) and a separate `refresh_token_version` carrying the `ignore_changes`. `accessor` still covers all five via `all_secret_ids`; `secretVersionAdder` stays scoped to the refresh token alone. **`terraform validate` passes** — worth noting, since renaming `secrets` → `all_secrets` and `versions` → `static_versions` touched every reference in the file and a single stale one would have broken `plan`.
+- **M-14** — real JSON formatter emitting `severity` for Cloud Logging (`main.py:13-23`), gated on `K_SERVICE`/`PORT` so local runs keep the human-readable format. Good touch.
+- **Docs** — `README.md:18` now reads "**Persistent State & Deduplication**" instead of "Stateless & Idempotent"; the "zero-manual-step" claim is gone; the architecture diagram includes the GCS bucket; `"Gemini 3.5 Flash"` → `"Gemini 2.5 Flash"` (a real model). `.env.example` documents `PROJECT_ID`, `STATE_BUCKET`, and `PLAYLIST_SHARING`.
+
+## 🔴 V-5 (medium). The marker skips permanently past tracks that failed mid-run
+
+`main.py:160`, `main.py:219-220`
+
+`new_highest_like_id` is computed **before** the loop, so it advances past every track in the batch once the loop finishes — regardless of whether individual tracks succeeded. Per-track failures are swallowed by the inner handlers (`main.py:177`, `186`, `205`), so a failed track neither reaches the playlist nor enters the notified ledger, yet the marker moves beyond it. Verified:
+
+```
+Run 1: likes = [110, 109, 108]; track 109 raises in add_track_to_genre_playlist
+       -> playlist_added=False, no Telegram, not in ledger; marker saved = 110
+Run 2: get_recent_likes(last_processed_like_id=110, ledger={110, 108})
+       -> returned: []
+```
+
+**Track 109 is never revisited** — not in any playlist, never notified, silently lost. A single transient 503 permanently drops a track.
+
+This is not a regression; it is the flip side of fixing V-1. Before V-1, the frozen marker retried everything forever. The original review's guidance was "write the marker only after a track fully succeeds," and the sentinel design makes that easiest to honour by refusing to advance at all when anything failed — the notified ledger already prevents duplicate work on the tracks that did succeed, so a re-scan is cheap.
+
+**Fix:**
+
+```python
+run_had_failures = False
+for track in recent_tracks:
+    ...
+    except Exception as e:
+        logger.error(...)
+        run_had_failures = True      # in each of the three per-track handlers
+    ...
+
+if Config.STATE_BUCKET:
+    if not run_had_failures:                       # only advance on a clean run
+        app_state["last_processed_like_id"] = new_highest_like_id
+    app_state["notified_track_ids"] = notified_track_ids   # ledger always persists
+```
+
+## Remaining, unchanged
+
+- **H-7** — deadline and instance cap done; the track loop at `main.py:162` is still sequential.
+- **M-12** — upper bounds and `urllib3>=2.0,<3.0` correct; still no lockfile or `--require-hashes`.
+- **M-13** — no remote backend; `terraform.tfstate` still holds plaintext secrets locally.
+- **M-15** — no `requirements-dev.txt`, no CI, and **`main.py` still has zero test coverage**. Worth restating: V-1, V-2, and V-5 all live in `main.py`. Every defect found across both verification passes was in the one file with no tests.
+- **L-4** (`expires_in` ignored), **L-5** (container 3.11 vs local 3.14), **L-6** (no `HEALTHCHECK`).
+- **Silent cap** — `max_pages = 10` truncates at 500 likes with no log line. The original review's own guidance was "no silent caps: `log()` what was dropped." One line: `if url and page_count >= max_pages: logger.warning(...)`.
+- **Nits** — `terraform fmt` wants two alignment fixes in `local.static_secrets_map` (`main.tf:104-105`); `Optional` is imported but unused in `state_manager.py:3`.

@@ -101,8 +101,8 @@ locals {
   static_secrets_map = {
     "soundcloud-client-id"     = var.soundcloud_client_id
     "soundcloud-client-secret" = var.soundcloud_client_secret
-    "telegram-bot-token"        = var.telegram_bot_token
-    "telegram-chat-id"          = var.telegram_chat_id
+    "telegram-bot-token"       = var.telegram_bot_token
+    "telegram-chat-id"         = var.telegram_chat_id
   }
 
   all_secret_ids = [

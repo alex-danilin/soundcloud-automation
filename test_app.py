@@ -140,5 +140,69 @@ class TestSoundCloudClient(unittest.TestCase):
             self.assertEqual(saved_data["notified_track_ids"][0], 101)
             self.assertEqual(saved_data["notified_track_ids"][-1], 600)
 
+    @patch("main.Config")
+    @patch("main.SoundCloudClient")
+    @patch("main.TelegramNotifier")
+    @patch("main.state_manager")
+    def test_main_v5_failure_does_not_advance_marker(self, mock_state_mgr, mock_tg, mock_sc_class, mock_config):
+        # Configure Config mocks
+        mock_config.SOUNDCLOUD_CLIENT_ID = "cid"
+        mock_config.SOUNDCLOUD_CLIENT_SECRET = "cs"
+        mock_config.SOUNDCLOUD_REFRESH_TOKEN = "rt"
+        mock_config.SOUNDCLOUD_ACCESS_TOKEN = "at"
+        mock_config.TELEGRAM_BOT_TOKEN = "tb"
+        mock_config.TELEGRAM_CHAT_ID = "tc"
+        mock_config.LOOKBACK_MINUTES = 65
+        mock_config.PLAYLIST_PREFIX = "Genre: "
+        mock_config.DEFAULT_GENRE = "Uncategorized"
+        mock_config.PLAYLIST_SHARING = "private"
+        mock_config.STATE_BUCKET = "my-test-bucket"
+
+        # Mock initial state with marker 100
+        mock_state_mgr.load_state.return_value = {
+            "last_processed_like_id": 100,
+            "notified_track_ids": [100]
+        }
+
+        # Mock SoundCloudClient instance
+        mock_sc_instance = MagicMock()
+        mock_sc_class.return_value = mock_sc_instance
+
+        # Return two tracks: 110 (newest) and 109
+        mock_tg_instance = MagicMock()
+        mock_tg.return_value = mock_tg_instance
+        mock_tg_instance.send_track_notification.return_value = True
+
+        mock_sc_instance.get_recent_likes.return_value = [
+            {"id": 110, "title": "Track 110", "genre": "Techno"},
+            {"id": 109, "title": "Track 109", "genre": "Techno"}
+        ]
+        mock_sc_instance.follow_artist.return_value = "FOLLOWED"
+        mock_sc_instance.extract_musical_key.return_value = "8A"
+
+        # Simulate track 109 failing in add_track_to_genre_playlist
+        def mock_add_track(track, genre):
+            if track["id"] == 109:
+                raise RuntimeError("503 Transient Playlist Error")
+            return "Genre: Techno", True
+
+        mock_sc_instance.add_track_to_genre_playlist.side_effect = mock_add_track
+
+        # Execute main HTTP function directly with mock request object
+        from main import main
+        mock_req = MagicMock()
+        mock_req.args = {"lookback_minutes": "65"}
+        mock_req.get_json.return_value = {}
+
+        resp_data, status_code = main(mock_req)
+        self.assertEqual(status_code, 200)
+
+        # Assert save_state was called
+        self.assertTrue(mock_state_mgr.save_state.called)
+        saved_state = mock_state_mgr.save_state.call_args[0][1]
+
+        # V-5 VERIFICATION: Due to failure on track 109, marker must NOT advance to 110
+        self.assertEqual(saved_state["last_processed_like_id"], 100)
+
 if __name__ == "__main__":
     unittest.main()
