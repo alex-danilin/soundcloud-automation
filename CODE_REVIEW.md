@@ -970,3 +970,107 @@ if Config.STATE_BUCKET:
 - **L-4** (`expires_in` ignored), **L-5** (container 3.11 vs local 3.14), **L-6** (no `HEALTHCHECK`).
 - **Silent cap** — `max_pages = 10` truncates at 500 likes with no log line. The original review's own guidance was "no silent caps: `log()` what was dropped." One line: `if url and page_count >= max_pages: logger.warning(...)`.
 - **Nits** — `terraform fmt` wants two alignment fixes in `local.static_secrets_map` (`main.tf:104-105`); `Optional` is imported but unused in `state_manager.py:3`.
+
+---
+---
+
+# Verification Pass 3 — commit `0d79338`
+
+**Date:** 2026-08-04
+**Reviewed:** `0d79338 fix: resolve V-5 partial run state marker flaw, pagination truncation warning & formatting`
+**Test status:** `python -m unittest test_app` → **10 passed, 0 failed** (new: `test_main_v5_failure_does_not_advance_marker` — the first `main.py` test)
+**Infra status:** `terraform validate` → **Success**; `terraform fmt -check` → **clean**
+
+**V-5 is fixed and pinned by a test.** But the fix treats one *supported* configuration as a permanent failure, re-pinning the marker it was written to unpin.
+
+## ✅ Verified fixed this pass
+
+- **V-5** — `run_had_failures` set in the playlist and Telegram handlers (`main.py:205, 224, 227`); marker only advances on a clean run (`main.py:242-245`), with a clear warning when held. Verified: track 109 fails → marker stays at `100`. Genuinely covered by `test_main_v5_failure_does_not_advance_marker`.
+- **Silent cap** — `soundcloud_client.py:187-188` now warns: `Reached max_pages limit (10) … Some older likes were not scanned.` Verified firing.
+- **Nits** — `terraform fmt` clean; unused `Optional` removed. `.terraform.lock.hcl` committed, which is correct practice.
+- **M-15** — upgraded from ❌ to 🟡: `main.py` has its first test. Still no `requirements-dev.txt` and no CI.
+
+## 🔴 V-6 (high). An unconfigured Telegram bot pins the marker forever
+
+`main.py:212-224`, `telegram_notifier.py:46-48`
+
+```python
+if playlist_added and track_id not in notified_lookup:
+    telegram_sent = telegram.send_track_notification(...)
+    if telegram_sent:
+        ...
+    else:
+        run_had_failures = True          # <-- treats "not configured" as "failed"
+```
+
+`send_track_notification` returns `False` for **two different reasons**: a genuine API error, and *Telegram simply not being configured* (`telegram_notifier.py:46-48`). The latter is an explicitly supported mode — `main.py:139-140` warns "Telegram credentials missing. Notifications will be skipped." and continues.
+
+Verified with Telegram unconfigured and **zero processing errors**, every track followed and filed successfully:
+
+```
+marker before run : 100
+marker after  run : 100   (should be 110)
+-> pinned forever
+```
+
+**Consequence:** for any deployment that skips Telegram, the marker never advances. Every run re-scans and re-processes the entire history from the original marker — unbounded growth, and V-1's fix is defeated in that configuration. The playlist dedupe keeps it from corrupting anything, but the run does escalating pointless work every hour and the `Run encountered processing errors` warning fires on every clean run, poisoning the signal V-5 added.
+
+**Fix** — distinguish "skipped" from "failed", following the tri-state precedent the codebase already adopted for M-8:
+
+```python
+# telegram_notifier.py — return "SENT" | "SKIPPED" | "FAILED"
+if not self.bot_token or not self.chat_id:
+    logger.warning("Telegram notification skipped: credentials not configured.")
+    return "SKIPPED"
+...
+return "SENT" if response.ok else "FAILED"
+```
+
+```python
+# main.py
+result = telegram.send_track_notification(...)
+telegram_sent = (result == "SENT")
+if telegram_sent:
+    notified_track_ids.append(track_id); notified_lookup.add(track_id)
+elif result == "FAILED":
+    run_had_failures = True          # only a real failure holds the marker
+```
+
+Minimal alternative: hoist `telegram_enabled = bool(Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID)` and guard with `elif telegram_enabled:`.
+
+## 🟡 V-7 (low). Failure handling is asymmetric across the three actions
+
+`follow_artist` catches internally and **returns** `"FAILED"` rather than raising (`soundcloud_client.py:202-204`), so `main.py:194-196`'s `except` never fires and `run_had_failures` is not set. Verified: `follow_artist → "FAILED"` still advanced the marker `100 → 110`, so that artist is never retried — while an identical-severity playlist or Telegram failure holds the marker.
+
+A missed follow being less serious than a missed playlist entry is a defensible call, but right now it is incidental rather than deliberate. Either set `run_had_failures = True` on `"FAILED"`, or add a comment recording that follow failures are intentionally non-blocking.
+
+## 🟡 V-8 (medium). `ImportError` shims add production risk to solve a dev-environment problem
+
+`main.py:5-24`
+
+Stub fallbacks were added for `functions_framework` and `flask` so the new `main.py` test can run locally — `functions_framework` is still not installed here (verified `ModuleNotFoundError`), so the shims are what make the suite green.
+
+Two problems:
+
+1. **Silent degradation instead of loud failure.** If `flask` were ever absent from the image, `jsonify` silently becomes a `json.dumps` wrapper and the HTTP contract changes shape rather than the container failing at startup. That is the same silent-fallback pattern that made C-4 invisible for so long.
+2. **The shim's signature does not match Flask's.** `jsonify(data, status_code=200)` returns a tuple, so `return jsonify({...}), 200` (`main.py:251`) yields a **nested** tuple `(('{...}', 200), 200)` under the shim versus `(Response, 200)` under real Flask. The test passes only because it asserts on the outer element. The test is therefore exercising a different return shape than production.
+
+**Fix:** delete the shims and add the real dependencies to a `requirements-dev.txt` — the M-15 recommendation. Testability is the right goal; a divergent production import path is the wrong mechanism.
+
+## Status of the original 36 findings
+
+| | Count | |
+|---|---|---|
+| ✅ Fully fixed & verified | 28 | C-1…C-5, H-1…H-6, H-8, M-1…M-11, M-14, L-1, L-2, L-3, L-7 |
+| 🟡 Partial | 3 | H-7 (concurrency), M-12 (no hashes/lockfile), M-15 (1 test, no CI) |
+| ❌ Not done | 4 | M-13, L-4, L-5, L-6 |
+| ⚪ Accepted as-is | 1 | L-8 |
+
+**Verification defects:** V-1…V-5 fixed · V-6, V-7, V-8 open.
+
+## Next
+
+1. **V-6** — the only one that changes runtime behaviour; tri-state the notifier
+2. **V-8** — drop the shims, add `requirements-dev.txt` (also closes M-15's remaining half)
+3. **V-7** — decide and document whether follow failures block
+4. Then the long-standing **M-13** (remote backend) and **H-7** (concurrency)

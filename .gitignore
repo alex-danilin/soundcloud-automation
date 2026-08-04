@@ -5,6 +5,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.coverage
+.pytest_cache/
 
 .venv/
 env/
@@ -22,5 +24,3 @@ ENV/
 *.tfstate.backup
 *.tfvars
 !terraform.tfvars.example
-
-

@@ -111,13 +111,18 @@ class TestSoundCloudClient(unittest.TestCase):
                 }
             }
             res = notifier.send_track_notification(track, "Genre: Rock & Roll", "ALREADY_FOLLOWING", "8A")
-            self.assertTrue(res)
+            self.assertEqual(res, "SENT")
             
             sent_payload = mock_post.call_args[1]["json"]
             sent_text = sent_payload["text"]
             self.assertIn("https://soundcloud.com/artist/track?param=1&amp;other=2", sent_text)
             self.assertIn("Artist &lt;One&gt;", sent_text)
             self.assertIn("ℹ️ Already Following", sent_text)
+
+    def test_telegram_unconfigured_returns_skipped(self):
+        notifier = TelegramNotifier(bot_token="", chat_id="")
+        res = notifier.send_track_notification({}, "Genre: Techno", "FOLLOWED", "8A")
+        self.assertEqual(res, "SKIPPED")
 
     def test_state_manager_fifo_capping(self):
         state = {
@@ -144,65 +149,96 @@ class TestSoundCloudClient(unittest.TestCase):
     @patch("main.SoundCloudClient")
     @patch("main.TelegramNotifier")
     @patch("main.state_manager")
-    def test_main_v5_failure_does_not_advance_marker(self, mock_state_mgr, mock_tg, mock_sc_class, mock_config):
-        # Configure Config mocks
-        mock_config.SOUNDCLOUD_CLIENT_ID = "cid"
-        mock_config.SOUNDCLOUD_CLIENT_SECRET = "cs"
-        mock_config.SOUNDCLOUD_REFRESH_TOKEN = "rt"
-        mock_config.SOUNDCLOUD_ACCESS_TOKEN = "at"
-        mock_config.TELEGRAM_BOT_TOKEN = "tb"
-        mock_config.TELEGRAM_CHAT_ID = "tc"
-        mock_config.LOOKBACK_MINUTES = 65
-        mock_config.PLAYLIST_PREFIX = "Genre: "
-        mock_config.DEFAULT_GENRE = "Uncategorized"
-        mock_config.PLAYLIST_SHARING = "private"
-        mock_config.STATE_BUCKET = "my-test-bucket"
-
-        # Mock initial state with marker 100
-        mock_state_mgr.load_state.return_value = {
-            "last_processed_like_id": 100,
-            "notified_track_ids": [100]
-        }
-
-        # Mock SoundCloudClient instance
-        mock_sc_instance = MagicMock()
-        mock_sc_class.return_value = mock_sc_instance
-
-        # Return two tracks: 110 (newest) and 109
-        mock_tg_instance = MagicMock()
-        mock_tg.return_value = mock_tg_instance
-        mock_tg_instance.send_track_notification.return_value = True
-
-        mock_sc_instance.get_recent_likes.return_value = [
-            {"id": 110, "title": "Track 110", "genre": "Techno"},
-            {"id": 109, "title": "Track 109", "genre": "Techno"}
+    def test_main_state_transitions_table_driven(self, mock_state_mgr, mock_tg, mock_sc_class, mock_config):
+        test_cases = [
+            {
+                "name": "Clean run: marker advances to 110",
+                "playlist_fail": False,
+                "tg_status": "SENT",
+                "follow_status": "FOLLOWED",
+                "expected_marker": 110
+            },
+            {
+                "name": "Playlist failure: marker held at 100",
+                "playlist_fail": True,
+                "tg_status": "SENT",
+                "follow_status": "FOLLOWED",
+                "expected_marker": 100
+            },
+            {
+                "name": "Telegram send API failure: marker held at 100",
+                "playlist_fail": False,
+                "tg_status": "FAILED",
+                "follow_status": "FOLLOWED",
+                "expected_marker": 100
+            },
+            {
+                "name": "Telegram unconfigured (SKIPPED): marker advances cleanly to 110",
+                "playlist_fail": False,
+                "tg_status": "SKIPPED",
+                "follow_status": "FOLLOWED",
+                "expected_marker": 110
+            },
+            {
+                "name": "Artist follow failure: marker held at 100",
+                "playlist_fail": False,
+                "tg_status": "SENT",
+                "follow_status": "FAILED",
+                "expected_marker": 100
+            }
         ]
-        mock_sc_instance.follow_artist.return_value = "FOLLOWED"
-        mock_sc_instance.extract_musical_key.return_value = "8A"
 
-        # Simulate track 109 failing in add_track_to_genre_playlist
-        def mock_add_track(track, genre):
-            if track["id"] == 109:
-                raise RuntimeError("503 Transient Playlist Error")
-            return "Genre: Techno", True
+        for tc in test_cases:
+            with self.subTest(case=tc["name"]):
+                mock_config.SOUNDCLOUD_CLIENT_ID = "cid"
+                mock_config.SOUNDCLOUD_CLIENT_SECRET = "cs"
+                mock_config.SOUNDCLOUD_REFRESH_TOKEN = "rt"
+                mock_config.TELEGRAM_BOT_TOKEN = "tb"
+                mock_config.TELEGRAM_CHAT_ID = "tc"
+                mock_config.LOOKBACK_MINUTES = 65
+                mock_config.PLAYLIST_PREFIX = "Genre: "
+                mock_config.DEFAULT_GENRE = "Uncategorized"
+                mock_config.PLAYLIST_SHARING = "private"
+                mock_config.STATE_BUCKET = "my-test-bucket"
 
-        mock_sc_instance.add_track_to_genre_playlist.side_effect = mock_add_track
+                mock_state_mgr.load_state.return_value = {
+                    "last_processed_like_id": 100,
+                    "notified_track_ids": [100]
+                }
 
-        # Execute main HTTP function directly with mock request object
-        from main import main
-        mock_req = MagicMock()
-        mock_req.args = {"lookback_minutes": "65"}
-        mock_req.get_json.return_value = {}
+                mock_sc_instance = MagicMock()
+                mock_sc_class.return_value = mock_sc_instance
+                mock_sc_instance.get_recent_likes.return_value = [
+                    {"id": 110, "title": "Track 110", "genre": "Techno", "user": {"id": 888}},
+                    {"id": 109, "title": "Track 109", "genre": "Techno", "user": {"id": 999}}
+                ]
+                mock_sc_instance.follow_artist.return_value = tc["follow_status"]
+                mock_sc_instance.extract_musical_key.return_value = "8A"
 
-        resp_data, status_code = main(mock_req)
-        self.assertEqual(status_code, 200)
+                if tc["playlist_fail"]:
+                    def fail_add(track, genre):
+                        if track["id"] == 109:
+                            raise RuntimeError("Playlist API Error")
+                        return "Genre: Techno", True
+                    mock_sc_instance.add_track_to_genre_playlist.side_effect = fail_add
+                else:
+                    mock_sc_instance.add_track_to_genre_playlist.side_effect = None
+                    mock_sc_instance.add_track_to_genre_playlist.return_value = ("Genre: Techno", True)
 
-        # Assert save_state was called
-        self.assertTrue(mock_state_mgr.save_state.called)
-        saved_state = mock_state_mgr.save_state.call_args[0][1]
+                mock_tg_instance = MagicMock()
+                mock_tg.return_value = mock_tg_instance
+                mock_tg_instance.send_track_notification.return_value = tc["tg_status"]
 
-        # V-5 VERIFICATION: Due to failure on track 109, marker must NOT advance to 110
-        self.assertEqual(saved_state["last_processed_like_id"], 100)
+                from main import main, app
+                mock_req = MagicMock()
+                mock_req.args = {}
+                mock_req.get_json.return_value = {}
+
+                with app.app_context():
+                    resp_data, status_code = main(mock_req)
+
+                saved_state = mock_state_mgr.save_state.call_args[0][1]
+                self.assertEqual(saved_state["last_processed_like_id"], tc["expected_marker"])
 
 if __name__ == "__main__":
     unittest.main()

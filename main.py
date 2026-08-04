@@ -2,26 +2,8 @@ import os
 import json
 import datetime
 import logging
-try:
-    import functions_framework
-except ImportError:
-    class DummyFunctionsFramework:
-        @staticmethod
-        def http(func):
-            return func
-    functions_framework = DummyFunctionsFramework()
-try:
-    from flask import jsonify, Flask, request as flask_request
-except ImportError:
-    import json
-    def jsonify(data, status_code=200):
-        return json.dumps(data), status_code
-    class Flask:
-        def __init__(self, name): pass
-        def route(self, *args, **kwargs):
-            return lambda f: f
-        def run(self, *args, **kwargs): pass
-    flask_request = None
+import functions_framework
+from flask import jsonify, Flask, request as flask_request
 from config import Config
 from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
@@ -191,9 +173,13 @@ def main(request_obj):
             if artist_id:
                 try:
                     follow_status = sc_client.follow_artist(artist_id)
+                    # V-7: If artist follow fails, mark failure so follow attempt can be retried
+                    if follow_status == "FAILED":
+                        run_had_failures = True
                 except Exception as e:
                     logger.error("Error following artist %s: %s", artist_id, e)
                     follow_status = "FAILED"
+                    run_had_failures = True
 
             # Action B: Add track to genre playlist (or create playlist)
             playlist_title = f"{Config.PLAYLIST_PREFIX}{genre}"
@@ -207,23 +193,25 @@ def main(request_obj):
             # Action C: Extract musical key signature
             musical_key = sc_client.extract_musical_key(track)
 
-            # Action D: Notify Telegram (H-2: ONLY notify if track was newly added and not previously notified)
-            telegram_sent = False
+            # Action D: Notify Telegram (H-2 & V-6 tri-state: ONLY notify if track was newly added and not previously notified)
+            telegram_status = "SKIPPED"
             if playlist_added and track_id not in notified_lookup:
                 try:
-                    telegram_sent = telegram.send_track_notification(
+                    telegram_status = telegram.send_track_notification(
                         track=track,
                         playlist_title=playlist_title,
                         artist_follow_status=follow_status,
                         musical_key=musical_key
                     )
-                    if telegram_sent:
+                    if telegram_status == "SENT":
                         notified_track_ids.append(track_id)
                         notified_lookup.add(track_id)
-                    else:
+                    elif telegram_status == "FAILED":
                         run_had_failures = True
+                    # Note: telegram_status == "SKIPPED" (unconfigured telegram) does NOT trigger run_had_failures
                 except Exception as e:
                     logger.error("Error sending Telegram notification for track %s: %s", track_id, e)
+                    telegram_status = "FAILED"
                     run_had_failures = True
 
             processed_summary.append({
@@ -234,7 +222,7 @@ def main(request_obj):
                 "musical_key": musical_key,
                 "artist_follow_status": follow_status,
                 "playlist_added": playlist_added,
-                "telegram_notified": telegram_sent
+                "telegram_status": telegram_status
             })
 
         # 5. Update state and persist to GCS
@@ -242,7 +230,7 @@ def main(request_obj):
             if not run_had_failures:
                 app_state["last_processed_like_id"] = new_highest_like_id
             else:
-                logger.warning("Run encountered processing errors. Keeping last_processed_like_id at %s to allow retrying failed tracks on next run.", last_processed_like_id)
+                logger.warning("Run encountered processing errors. Keeping last_processed_like_id at %s to allow retrying failed operations on next run.", last_processed_like_id)
 
             app_state["notified_track_ids"] = notified_track_ids
             app_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -263,12 +251,12 @@ def main(request_obj):
             "message": "An internal error occurred during execution."
         }), 500
 
+app = Flask(__name__)
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    return main(flask_request)
+
 if __name__ == "__main__":
-    from flask import Flask, request as flask_request
-    app = Flask(__name__)
-    @app.route("/", methods=["GET", "POST"])
-    def index():
-        return main(flask_request)
-    
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

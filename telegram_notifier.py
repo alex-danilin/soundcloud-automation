@@ -39,13 +39,14 @@ class TelegramNotifier:
         playlist_title: str,
         artist_follow_status: Union[str, bool],
         musical_key: str
-    ) -> bool:
+    ) -> str:
         """
         Formats and posts a notification message for a processed SoundCloud track.
+        Returns tri-state string: 'SENT', 'SKIPPED', or 'FAILED'.
         """
         if not self.bot_token or not self.chat_id:
             logger.warning("Telegram notification skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.")
-            return False
+            return "SKIPPED"
 
         title = html.escape(track.get("title", "Unknown Track"))
         permalink_url = _safe_url(track.get("permalink_url"))
@@ -90,8 +91,8 @@ class TelegramNotifier:
             response = self.session.post(api_url, json=payload, timeout=10)
             if not response.ok:
                 logger.error("Telegram API Error: %s - %s", response.status_code, response.text)
-                return False
-            return True
+                return "FAILED"
+            return "SENT"
         except Exception as e:
             logger.error("Failed to send Telegram message: %s", e)
-            return False
+            return "FAILED"
