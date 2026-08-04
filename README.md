@@ -2,7 +2,7 @@
 
 [![GCP Cloud Run](https://img.shields.io/badge/GCP-Cloud%20Run-blue?logo=googlecloud)](https://cloud.google.com/run)
 [![Terraform](https://img.shields.io/badge/Terraform-1.3+-623CE4?logo=terraform)](https://www.terraform.io)
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python)](https://python.org)
 
 Lightweight, stateless, open-source automation microservice deployed on **Google Cloud Run** via **Terraform**. When triggered periodically (via GCP Cloud Scheduler every hour), it checks your recently liked tracks on SoundCloud, automatically follows the track artist, organizes the track into a genre-specific playlist (creating the playlist if missing), and notifies you via a **Telegram Bot** with track links, genre, and detected musical key.
