@@ -1,8 +1,67 @@
+import os
+import datetime
+import logging
 import functions_framework
-from flask import jsonify, request
+from flask import jsonify
 from config import Config
 from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
+import state_manager
+
+# Configure structured logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("soundcloud_automation")
+
+def _get_gcp_project_id() -> str:
+    """Resolves GCP Project ID from env vars or Cloud Run metadata server."""
+    if Config.PROJECT_ID:
+        return Config.PROJECT_ID
+
+    for env_key in ("GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "PROJECT_ID"):
+        if os.environ.get(env_key):
+            return os.environ[env_key]
+
+    try:
+        import requests
+        resp = requests.get(
+            "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=2
+        )
+        if resp.ok and resp.text:
+            return resp.text.strip()
+    except Exception:
+        pass
+
+    return ""
+
+def _persist_refreshed_token(new_access_token: str, new_refresh_token: str):
+    """
+    Callback triggered when SoundCloud issues a new access or rotated refresh token.
+    Persists the new refresh token to GCP Secret Manager.
+    """
+    logger.info("SoundCloud token refreshed successfully. Updating rotated refresh token.")
+    project_id = _get_gcp_project_id()
+    secret_id = "soundcloud-refresh-token"
+    
+    if not project_id:
+        logger.warning("GCP Project ID could not be determined. Skipping Secret Manager token persistence.")
+        return
+
+    if not new_refresh_token:
+        return
+
+    try:
+        from google.cloud import secretmanager
+        client = secretmanager.SecretManagerServiceClient()
+        parent = f"projects/{project_id}/secrets/{secret_id}"
+        response = client.add_secret_version(
+            request={"parent": parent, "payload": {"data": new_refresh_token.encode("UTF-8")}}
+        )
+        logger.info("Successfully persisted rotated refresh token version to Secret Manager: %s", response.name)
+    except Exception as sm_err:
+        logger.error("FAILED to persist rotated refresh token to Secret Manager (%s). "
+                     "Ensure runtime SA has roles/secretmanager.secretVersionAdder.", sm_err)
 
 @functions_framework.http
 def main(request_obj):
@@ -10,7 +69,7 @@ def main(request_obj):
     HTTP Cloud Function / Cloud Run entry point.
     Triggered periodically via GCP Cloud Scheduler or HTTP GET/POST.
     """
-    # 1. Parse optional query parameters or JSON body for custom lookback
+    # 1. M-3: Parse & validate optional lookback minutes parameter with safe exception handling
     lookback = Config.LOOKBACK_MINUTES
     
     if request_obj:
@@ -19,19 +78,21 @@ def main(request_obj):
         custom_lookback = args.get("lookback_minutes") or json_data.get("lookback_minutes")
         if custom_lookback:
             try:
-                lookback = int(custom_lookback)
-            except ValueError:
-                pass
+                parsed_val = int(custom_lookback)
+                lookback = max(1, min(parsed_val, 10080))
+            except (ValueError, TypeError):
+                logger.warning("Invalid lookback_minutes parameter provided: %s", custom_lookback)
 
     # 2. Check essential credentials
     if not Config.SOUNDCLOUD_CLIENT_ID or not Config.SOUNDCLOUD_CLIENT_SECRET or not Config.SOUNDCLOUD_REFRESH_TOKEN:
+        logger.error("SoundCloud credentials missing.")
         return jsonify({
             "status": "error",
             "message": "SoundCloud API credentials (client_id, client_secret, refresh_token) are missing."
         }), 500
 
     if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
-        print("Warning: Telegram credentials missing. Notifications will be skipped.")
+        logger.warning("Telegram credentials missing. Notifications will be skipped.")
 
     sc_client = SoundCloudClient(
         client_id=Config.SOUNDCLOUD_CLIENT_ID,
@@ -39,7 +100,9 @@ def main(request_obj):
         refresh_token=Config.SOUNDCLOUD_REFRESH_TOKEN,
         access_token=Config.SOUNDCLOUD_ACCESS_TOKEN,
         playlist_prefix=Config.PLAYLIST_PREFIX,
-        default_genre=Config.DEFAULT_GENRE
+        default_genre=Config.DEFAULT_GENRE,
+        playlist_sharing=Config.PLAYLIST_SHARING,
+        on_token_refresh=_persist_refreshed_token
     )
 
     telegram = TelegramNotifier(
@@ -47,26 +110,44 @@ def main(request_obj):
         chat_id=Config.TELEGRAM_CHAT_ID
     )
 
+    # 3. Load state from GCS bucket if configured
+    app_state = state_manager.load_state(Config.STATE_BUCKET)
+    last_processed_like_id = app_state.get("last_processed_like_id")
+    notified_track_ids = set(app_state.get("notified_track_ids", []))
+
     processed_summary = []
+    new_highest_like_id = last_processed_like_id
 
     try:
-        # 3. Fetch recent likes within lookback window
-        recent_tracks = sc_client.get_recent_likes(lookback_minutes=lookback)
-        print(f"Found {len(recent_tracks)} liked tracks in the last {lookback} minutes.")
+        # 4. Fetch recent likes (passing state for exact position boundary)
+        recent_tracks = sc_client.get_recent_likes(
+            lookback_minutes=lookback,
+            last_processed_like_id=last_processed_like_id,
+            processed_ids=notified_track_ids
+        )
+        logger.info("Found %d liked tracks to process.", len(recent_tracks))
 
         for track in recent_tracks:
             track_id = track.get("id")
+            if not track_id:
+                continue
+
+            # Keep track of highest (most recent) liked track ID
+            if new_highest_like_id is None:
+                new_highest_like_id = track_id
+
             track_title = track.get("title", "Unknown Track")
             artist_id = track.get("user", {}).get("id")
             genre = track.get("genre") or Config.DEFAULT_GENRE
 
-            # Action A: Follow the artist
-            artist_followed = False
+            # Action A: Follow the artist (M-8 tri-state)
+            follow_status = "SKIPPED"
             if artist_id:
                 try:
-                    artist_followed = sc_client.follow_artist(artist_id)
+                    follow_status = sc_client.follow_artist(artist_id)
                 except Exception as e:
-                    print(f"Error following artist {artist_id}: {e}")
+                    logger.error("Error following artist %s: %s", artist_id, e)
+                    follow_status = "FAILED"
 
             # Action B: Add track to genre playlist (or create playlist)
             playlist_title = f"{Config.PLAYLIST_PREFIX}{genre}"
@@ -74,22 +155,25 @@ def main(request_obj):
             try:
                 playlist_title, playlist_added = sc_client.add_track_to_genre_playlist(track, genre)
             except Exception as e:
-                print(f"Error adding track {track_id} to genre playlist: {e}")
+                logger.error("Error adding track %s to genre playlist: %s", track_id, e)
 
             # Action C: Extract musical key signature
             musical_key = sc_client.extract_musical_key(track)
 
-            # Action D: Notify Telegram
+            # Action D: Notify Telegram (H-2: ONLY notify if track was newly added and not previously notified)
             telegram_sent = False
-            try:
-                telegram_sent = telegram.send_track_notification(
-                    track=track,
-                    playlist_title=playlist_title,
-                    artist_followed=artist_followed,
-                    musical_key=musical_key
-                )
-            except Exception as e:
-                print(f"Error sending Telegram notification for track {track_id}: {e}")
+            if playlist_added and track_id not in notified_track_ids:
+                try:
+                    telegram_sent = telegram.send_track_notification(
+                        track=track,
+                        playlist_title=playlist_title,
+                        artist_follow_status=follow_status,
+                        musical_key=musical_key
+                    )
+                    if telegram_sent:
+                        notified_track_ids.add(track_id)
+                except Exception as e:
+                    logger.error("Error sending Telegram notification for track %s: %s", track_id, e)
 
             processed_summary.append({
                 "track_id": track_id,
@@ -97,9 +181,17 @@ def main(request_obj):
                 "genre": genre,
                 "playlist": playlist_title,
                 "musical_key": musical_key,
-                "artist_followed": artist_followed,
+                "artist_follow_status": follow_status,
+                "playlist_added": playlist_added,
                 "telegram_notified": telegram_sent
             })
+
+        # 5. Update state and persist to GCS
+        if Config.STATE_BUCKET:
+            app_state["last_processed_like_id"] = new_highest_like_id or last_processed_like_id
+            app_state["notified_track_ids"] = list(notified_track_ids)
+            app_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            state_manager.save_state(Config.STATE_BUCKET, app_state)
 
         return jsonify({
             "status": "success",
@@ -109,15 +201,14 @@ def main(request_obj):
         }), 200
 
     except Exception as err:
-        print(f"Execution failed: {err}")
+        # M-5: Log error detail server-side, return safe error response to client
+        logger.exception("Execution failed: %s", err)
         return jsonify({
             "status": "error",
-            "message": str(err)
+            "message": "An internal error occurred during execution."
         }), 500
 
 if __name__ == "__main__":
-    import os
-    # For local execution testing
     from flask import Flask, request as flask_request
     app = Flask(__name__)
     @app.route("/", methods=["GET", "POST"])

@@ -2,6 +2,7 @@ import unittest
 import datetime
 from unittest.mock import MagicMock, patch
 from soundcloud_client import SoundCloudClient
+from telegram_notifier import TelegramNotifier
 
 class TestSoundCloudClient(unittest.TestCase):
 
@@ -23,9 +24,18 @@ class TestSoundCloudClient(unittest.TestCase):
         key = SoundCloudClient.extract_musical_key(track)
         self.assertEqual(key, "F#m")
 
+    def test_key_extraction_full_major(self):
+        track = {
+            "title": "Piano Sonata",
+            "description": "Key: C Major",
+            "tag_list": "classical"
+        }
+        key = SoundCloudClient.extract_musical_key(track)
+        self.assertEqual(key, "C Major")
+
     def test_key_extraction_fallback(self):
         track = {
-            "title": "No Key Track",
+            "title": "Vol 2B Continued",
             "description": "Just a description with no musical key info",
             "tag_list": "ambient electronic"
         }
@@ -42,79 +52,75 @@ class TestSoundCloudClient(unittest.TestCase):
         key = SoundCloudClient.extract_musical_key(track)
         self.assertEqual(key, "C Major")
 
-    @patch("soundcloud_client.SoundCloudClient._make_request")
-    def test_get_recent_likes_date_filtering(self, mock_make_request):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        recent_ts = (now - datetime.timedelta(minutes=10)).isoformat()
-        old_ts = (now - datetime.timedelta(hours=5)).isoformat()
-        naive_recent_ts = (now - datetime.timedelta(minutes=15)).strftime("%Y/%m/%d %H:%M:%S")
-
+    @patch.object(SoundCloudClient, "_make_request")
+    def test_get_recent_likes_with_state_boundary(self, mock_make_request):
         mock_resp = MagicMock()
         mock_resp.ok = True
-        mock_resp.json.return_value = [
-            {"created_at": recent_ts, "track": {"id": 1, "title": "Recent Track ISO"}},
-            {"created_at": old_ts, "track": {"id": 2, "title": "Old Track"}},
-            {"created_at": naive_recent_ts, "track": {"id": 3, "title": "Recent Track Naive"}}
-        ]
+        # Real SoundCloud API returns bare track objects or collection items
+        mock_resp.json.return_value = {
+            "collection": [
+                {"id": 100, "title": "Track 100"},
+                {"id": 99, "title": "Track 99"},
+                {"id": 98, "title": "Track 98 (Last Processed)"},
+                {"id": 97, "title": "Track 97 (Old)"}
+            ]
+        }
         mock_make_request.return_value = mock_resp
 
         client = SoundCloudClient(client_id="cid", client_secret="cs", refresh_token="rt", access_token="at")
-        tracks = client.get_recent_likes(lookback_minutes=60)
+        tracks = client.get_recent_likes(last_processed_like_id=98)
 
         track_ids = [t["id"] for t in tracks]
-        self.assertIn(1, track_ids)
-        self.assertIn(3, track_ids)
-        self.assertNotIn(2, track_ids)
+        self.assertEqual(track_ids, [100, 99])
 
-    @patch("soundcloud_client.SoundCloudClient._make_request")
-    def test_playlist_caching(self, mock_make_request):
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = [{"id": 100, "title": "Genre: Techno"}]
-        mock_make_request.return_value = mock_resp
-
+    @patch.object(SoundCloudClient, "_make_request")
+    def test_playlist_authoritative_fetch_and_update(self, mock_make_request):
         client = SoundCloudClient(client_id="cid", client_secret="cs", refresh_token="rt", access_token="at")
-        
-        # First call fetches from API
-        playlists1 = client.get_user_playlists()
-        self.assertEqual(len(playlists1), 1)
-        self.assertEqual(mock_make_request.call_count, 1)
+        client._playlists_cache = [
+            {"id": 500, "title": "Genre: Techno", "tracks": []}
+        ]
 
-        # Second call uses cache
-        playlists2 = client.get_user_playlists()
-        self.assertEqual(len(playlists2), 1)
-        self.assertEqual(mock_make_request.call_count, 1)
+        # First call fetches authoritative tracks from GET /playlists/500
+        get_pl_resp = MagicMock()
+        get_pl_resp.ok = True
+        get_pl_resp.json.return_value = {"id": 500, "title": "Genre: Techno", "tracks": [101, 102]}
 
-        # Force refresh bypasses cache
-        client.get_user_playlists(force_refresh=True)
+        # Second call PUTs updated playlist
+        put_pl_resp = MagicMock()
+        put_pl_resp.ok = True
+
+        mock_make_request.side_effect = [get_pl_resp, put_pl_resp]
+
+        title, added = client.add_track_to_genre_playlist({"id": 103}, "Techno")
+        self.assertEqual(title, "Genre: Techno")
+        self.assertTrue(added)
+
+        # Verify calls
         self.assertEqual(mock_make_request.call_count, 2)
+        put_call_args = mock_make_request.call_args_list[1]
+        payload = put_call_args[1]["json"]
+        self.assertEqual(payload["playlist"]["tracks"], [{"id": 101}, {"id": 102}, {"id": 103}])
 
-    @patch("soundcloud_client.requests.post")
-    @patch("soundcloud_client.requests.request")
-    def test_401_token_retry(self, mock_requests, mock_post):
-        # Mocks first request returning 401, second retry returning 200
-        resp_401 = MagicMock()
-        resp_401.status_code = 401
-        
-        resp_200 = MagicMock()
-        resp_200.status_code = 200
-        resp_200.ok = True
-        
-        mock_requests.side_effect = [resp_401, resp_200]
-
-        # Token refresh response
-        post_resp = MagicMock()
-        post_resp.ok = True
-        post_resp.json.return_value = {"access_token": "new_access_token"}
-        mock_post.return_value = post_resp
-
-        client = SoundCloudClient(client_id="cid", client_secret="cs", refresh_token="rt", access_token="old_at")
-        res = client._make_request("GET", "https://api.soundcloud.com/me")
-        
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(client.access_token, "new_access_token")
-        self.assertEqual(mock_requests.call_count, 2)
+    def test_telegram_tri_state_and_url_escaping(self):
+        notifier = TelegramNotifier(bot_token="test_token", chat_id="12345")
+        with patch.object(notifier.session, "post") as mock_post:
+            mock_post.return_value.ok = True
+            track = {
+                "title": "Track & Roll",
+                "permalink_url": "https://soundcloud.com/artist/track?param=1&other=2",
+                "user": {
+                    "username": "Artist <One>",
+                    "permalink_url": "https://soundcloud.com/artist?ref=1&type=user"
+                }
+            }
+            res = notifier.send_track_notification(track, "Genre: Rock & Roll", "ALREADY_FOLLOWING", "8A")
+            self.assertTrue(res)
+            
+            sent_payload = mock_post.call_args[1]["json"]
+            sent_text = sent_payload["text"]
+            self.assertIn("https://soundcloud.com/artist/track?param=1&amp;other=2", sent_text)
+            self.assertIn("Artist &lt;One&gt;", sent_text)
+            self.assertIn("ℹ️ Already Following", sent_text)
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -52,6 +52,11 @@ variable "lookback_minutes" {
   type        = string
   description = "Lookback window in minutes for liked tracks"
   default     = "65"
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.lookback_minutes)) && tonumber(var.lookback_minutes) >= 1 && tonumber(var.lookback_minutes) <= 10080
+    error_message = "The lookback_minutes variable must be a numeric string between 1 and 10080."
+  }
 }
 
 variable "playlist_prefix" {
@@ -64,4 +69,10 @@ variable "default_genre" {
   type        = string
   description = "Default fallback genre"
   default     = "Uncategorized"
+}
+
+variable "playlist_sharing" {
+  type        = string
+  description = "Privacy setting for auto-created playlists (private or public)"
+  default     = "private"
 }

@@ -5,6 +5,10 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
   }
 }
 
@@ -19,13 +23,80 @@ resource "google_project_service" "apis" {
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "cloudbuild.googleapis.com",
-    "scheduler.googleapis.com"
+    "scheduler.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "storage.googleapis.com"
   ])
   service            = each.key
   disable_on_destroy = false
 }
 
-# 2. Secret Manager Resources
+# 2. Artifact Registry Repository & Container Build (C-3)
+resource "google_artifact_registry_repository" "repo" {
+  location      = var.region
+  repository_id = var.service_name
+  format        = "DOCKER"
+  description   = "Docker repository for SoundCloud Automation Cloud Run service"
+  depends_on    = [google_project_service.apis]
+}
+
+resource "null_resource" "build_push" {
+  triggers = {
+    src_hash = sha1(join("", [for f in fileset("${path.module}/..", "*.py") : filesha1("${path.module}/../${f}")]))
+  }
+
+  provisioner "local-exec" {
+    command = "gcloud builds submit ${path.module}/.. --tag ${var.region}-docker.pkg.dev/${var.project_id}/${var.service_name}/app:latest --project ${var.project_id}"
+  }
+
+  depends_on = [
+    google_project_service.apis,
+    google_artifact_registry_repository.repo
+  ]
+}
+
+# 3. Dedicated Service Accounts (C-2, M-9)
+resource "google_service_account" "runtime_sa" {
+  account_id   = "${var.service_name}-runtime-sa"
+  display_name = "SoundCloud Bot Runtime Service Account"
+  depends_on   = [google_project_service.apis]
+}
+
+resource "google_service_account" "invoker_sa" {
+  account_id   = "${var.service_name}-invoker-sa"
+  display_name = "Cloud Scheduler Invoker Service Account"
+  depends_on   = [google_project_service.apis]
+}
+
+# 4. GCS State Bucket for persistent state (Section 6)
+resource "google_storage_bucket" "state" {
+  name                        = "${var.project_id}-${var.service_name}-state"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 10
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_storage_bucket_iam_member" "state_rw" {
+  bucket = google_storage_bucket.state.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.runtime_sa.email}"
+}
+
+# 5. Secret Manager Resources
 locals {
   secrets_map = {
     "soundcloud-client-id"     = var.soundcloud_client_id
@@ -51,17 +122,43 @@ resource "google_secret_manager_secret_version" "versions" {
   for_each    = local.secrets_map
   secret      = google_secret_manager_secret.secrets[each.key].id
   secret_data = each.value
+
+  # H-4: Do not clobber rotated live refresh tokens on subsequent terraform apply
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
 }
 
-# 3. Cloud Run v2 Service
+# Grant Runtime SA Secret Manager Access (C-2, C-4)
+resource "google_secret_manager_secret_iam_member" "accessor" {
+  for_each  = local.secrets_map
+  secret_id = google_secret_manager_secret.secrets[each.key].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "refresh_token_version_adder" {
+  secret_id = google_secret_manager_secret.secrets["soundcloud-refresh-token"].secret_id
+  role      = "roles/secretmanager.secretVersionAdder"
+  member    = "serviceAccount:${google_service_account.runtime_sa.email}"
+}
+
+# 6. Cloud Run v2 Service
 resource "google_cloud_run_v2_service" "default" {
   name     = var.service_name
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
 
   template {
+    service_account = google_service_account.runtime_sa.email
+    timeout         = "600s"
+
+    scaling {
+      max_instance_count = 2
+    }
+
     containers {
-      image = "gcr.io/${var.project_id}/${var.service_name}:latest"
+      image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.service_name}/app:latest"
 
       resources {
         limits = {
@@ -70,6 +167,14 @@ resource "google_cloud_run_v2_service" "default" {
         }
       }
 
+      env {
+        name  = "PROJECT_ID"
+        value = var.project_id
+      }
+      env {
+        name  = "STATE_BUCKET"
+        value = google_storage_bucket.state.name
+      }
       env {
         name  = "LOOKBACK_MINUTES"
         value = var.lookback_minutes
@@ -81,6 +186,10 @@ resource "google_cloud_run_v2_service" "default" {
       env {
         name  = "DEFAULT_GENRE"
         value = var.default_genre
+      }
+      env {
+        name  = "PLAYLIST_SHARING"
+        value = var.playlist_sharing
       }
 
       # Secret environment variables mounted from Secret Manager
@@ -134,33 +243,40 @@ resource "google_cloud_run_v2_service" "default" {
 
   depends_on = [
     google_project_service.apis,
-    google_secret_manager_secret_version.versions
+    google_secret_manager_secret_version.versions,
+    google_secret_manager_secret_iam_member.accessor,
+    null_resource.build_push
   ]
 }
 
-# 4. Allow Unauthenticated Access (Public Invoker for HTTP Trigger)
-resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+# 7. IAM for Cloud Scheduler Invocation
+resource "google_cloud_run_v2_service_iam_member" "scheduler_invoker" {
   location = google_cloud_run_v2_service.default.location
   name     = google_cloud_run_v2_service.default.name
   role     = "roles/run.invoker"
-  member   = "allUsers"
+  member   = "serviceAccount:${google_service_account.invoker_sa.email}"
 }
 
-# 5. Cloud Scheduler Job (Hourly Trigger)
+# 8. Cloud Scheduler Job (Hourly Authenticated Trigger)
 resource "google_cloud_scheduler_job" "hourly_sync" {
   name             = "${var.service_name}-hourly-sync"
   description      = "Hourly trigger for SoundCloud auto-playlist sync"
   schedule         = "0 * * * *"
   time_zone        = "UTC"
-  attempt_deadline = "180s"
+  attempt_deadline = "600s"
 
   http_target {
     http_method = "GET"
     uri         = google_cloud_run_v2_service.default.uri
+
+    oidc_token {
+      service_account_email = google_service_account.invoker_sa.email
+    }
   }
 
   depends_on = [
     google_project_service.apis,
-    google_cloud_run_v2_service.default
+    google_cloud_run_v2_service.default,
+    google_service_account.invoker_sa
   ]
 }

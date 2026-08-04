@@ -4,6 +4,9 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# M-11: Create non-root user for container security hardening
+RUN useradd --create-home --uid 10001 appuser
+
 WORKDIR /app
 
 # Install dependencies
@@ -12,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY . .
+RUN chown -R appuser:appuser /app
+
+USER 10001
 
 # Cloud Run injects PORT environment variable (default 8080)
 ENV PORT=8080
