@@ -1,0 +1,14 @@
+project_id               = "your-gcp-project-id"
+region                   = "us-central1"
+service_name             = "soundcloud-auto-playlist"
+
+soundcloud_client_id     = "your_soundcloud_client_id"
+soundcloud_client_secret = "your_soundcloud_client_secret"
+soundcloud_refresh_token = "your_soundcloud_refresh_token"
+
+telegram_bot_token       = "your_telegram_bot_token"
+telegram_chat_id         = "your_telegram_chat_id"
+
+lookback_minutes         = "65"
+playlist_prefix          = "Genre: "
+default_genre            = "Uncategorized"
