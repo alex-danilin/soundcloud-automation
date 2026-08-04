@@ -1,0 +1,15 @@
+.git
+.gitignore
+.dockerignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+terraform/
+test_app.py
+README.md
+LICENSE
+.vscode/
+.idea/
