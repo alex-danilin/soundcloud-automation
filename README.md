@@ -92,14 +92,25 @@ default_genre            = "Uncategorized"
 playlist_sharing         = "private"
 ```
 
-### 3. Apply Terraform Infrastructure
+### 3. (Optional) Remote Terraform GCS State
+For production deployments, Terraform state can be stored in a remote GCS bucket with state locking. Create a `terraform/backend.hcl` file:
+
+```hcl
+bucket = "your-gcp-project-id-tfstate"
+prefix = "soundcloud-bot"
+```
+
+Then initialize Terraform with the backend config:
+
+```powershell
+terraform init -backend-config=backend.hcl
+```
+
+### 4. Apply Terraform Infrastructure
 
 Deploy the entire stack with Terraform:
 
 ```powershell
-# Initialize Terraform providers
-terraform init
-
 # Preview resource creation
 terraform plan
 
@@ -107,14 +118,37 @@ terraform plan
 terraform apply -auto-approve
 ```
 
-### What Terraform Provisions Automatically:
+---
+
+## 🧪 Local Development & Testing
+
+Local development and testing use hash-pinned dependencies (`requirements-dev.txt`):
+
+```powershell
+# Install dev dependencies
+pip install -r requirements-dev.txt
+
+# Run full test suite with coverage
+python -m pytest test_app.py
+```
+
+Dependencies are managed via `pip-tools` (`requirements.in` and `requirements-dev.in`). To update lockfiles with hashes:
+
+```powershell
+pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+pip-compile --generate-hashes --output-file=requirements-dev.txt requirements-dev.in
+```
+
+---
+
+## 💡 What Terraform Provisions Automatically:
 
 1. **GCP Service Enablement:** Enables `run`, `secretmanager`, `cloudbuild`, `artifactregistry`, `storage`, and `scheduler` APIs.
 2. **Artifact Registry & Build:** Provisions Docker repository and builds/pushes the microservice image via Cloud Build.
 3. **GCP Secret Manager:** Secures SoundCloud & Telegram credentials as secret versions with rotation lifecycle management.
 4. **GCS State Bucket:** Provisions state storage for exact resume boundaries and notified track ledgers.
 5. **IAM Service Accounts:** Provisions runtime service accounts with least-privilege `secretAccessor`, `secretVersionAdder`, and `objectAdmin` permissions.
-6. **Cloud Run v2 Service:** Deploys the Python microservice container in `us-central1` with secrets securely mounted.
+6. **Cloud Run v2 Service:** Deploys the Python microservice container in `us-central1` with secrets securely mounted and startup probes enabled.
 7. **Cloud Scheduler Job:** Creates an hourly cron job (`0 * * * *`) authenticating via OIDC service account token.
 
 ---
