@@ -2,65 +2,60 @@ import json
 import logging
 from typing import Dict, Any
 
-try:
-    from google.cloud import storage
-except ImportError:
-    storage = None  # Lazy/fallback import if google-cloud-storage is not present in dev
+from google.cloud import storage
+from google.api_core import exceptions as gcp_exceptions
 
 logger = logging.getLogger("soundcloud_automation")
 _STATE_OBJECT_NAME = "state.json"
 
 def load_state(bucket_name: str) -> Dict[str, Any]:
     """
-    Loads persistent state dictionary from GCS bucket.
-    Returns empty dict on first run or if state object is missing/corrupt.
+    Loads persistent state from GCS.
+    Returns {} ONLY when state is legitimately absent (first run) or no bucket is configured.
+    Raises on any other fault — a failed load must never masquerade as a first run,
+    because that resets the resume marker and re-notifies up to 500 tracks.
     """
     if not bucket_name:
         return {}
 
+    blob = storage.Client().bucket(bucket_name).blob(_STATE_OBJECT_NAME)
     try:
-        if storage is None:
-            logger.warning("google-cloud-storage library not available.")
-            return {}
-
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(_STATE_OBJECT_NAME)
-        
-        if not blob.exists():
-            logger.info("No state object found in bucket '%s'. Starting fresh.", bucket_name)
-            return {}
-
         content = blob.download_as_bytes()
-        state = json.loads(content)
-        logger.info("Successfully loaded state from bucket '%s'. Last processed ID: %s",
-                    bucket_name, state.get("last_processed_like_id"))
-        return state
-    except Exception as e:
-        logger.warning("Could not load state from GCS bucket '%s': %s. Treating as first run.", bucket_name, e)
+    except gcp_exceptions.NotFound:
+        logger.info("No state object in bucket '%s'. Treating as first run.", bucket_name)
         return {}
+
+    try:
+        state = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"State object in '{bucket_name}' is corrupt: {e}. "
+            f"Refusing to continue — fix or delete gs://{bucket_name}/{_STATE_OBJECT_NAME} to force a first run."
+        ) from e
+
+    if not isinstance(state, dict):
+        raise RuntimeError(f"State object in '{bucket_name}' is not a JSON object.")
+
+    logger.info("Loaded state from '%s'. Last processed ID: %s",
+                bucket_name, state.get("last_processed_like_id"))
+    return state
 
 def save_state(bucket_name: str, state: Dict[str, Any]) -> None:
     """
     Saves state dictionary to GCS bucket.
     Caps notified_track_ids to last 500 entries (FIFO).
+    Raises on error so execution fails loudly.
     """
     if not bucket_name:
         return
 
-    # FIFO cap notified_track_ids to max 500 entries
-    if "notified_track_ids" in state and isinstance(state["notified_track_ids"], list):
+    if isinstance(state.get("notified_track_ids"), list):
         state["notified_track_ids"] = state["notified_track_ids"][-500:]
 
     try:
-        if storage is None:
-            logger.warning("google-cloud-storage library not available.")
-            return
-
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(_STATE_OBJECT_NAME)
+        blob = storage.Client().bucket(bucket_name).blob(_STATE_OBJECT_NAME)
         blob.upload_from_string(json.dumps(state, indent=2), content_type="application/json")
-        logger.info("Successfully saved updated state to bucket '%s'.", bucket_name)
+        logger.info("Saved state to '%s'.", bucket_name)
     except Exception as e:
-        logger.warning("Failed to save state to GCS bucket '%s': %s", bucket_name, e)
+        logger.error("FAILED to persist state to '%s': %s. Next run will reprocess this window.", bucket_name, e)
+        raise

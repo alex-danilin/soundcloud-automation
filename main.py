@@ -159,6 +159,9 @@ def main(request_obj):
         run_had_failures = False
         new_highest_like_id = recent_tracks[0]["id"] if recent_tracks and "id" in recent_tracks[0] else last_processed_like_id
 
+        # H-7: Intentionally sequential. Playlist PUTs are read-modify-write and must be
+        # serialised per playlist; the resume marker + notified ledger keep each run small
+        # enough that the 600s budget is ample. See CODE_REVIEW.md H-7 before parallelising.
         for track in recent_tracks:
             track_id = track.get("id")
             if not track_id:
@@ -251,12 +254,12 @@ def main(request_obj):
             "message": "An internal error occurred during execution."
         }), 500
 
-app = Flask(__name__)
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    return main(flask_request)
-
 if __name__ == "__main__":
+    app = Flask(__name__)
+
+    @app.route("/", methods=["GET", "POST"])
+    def index():
+        return main(flask_request)
+
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

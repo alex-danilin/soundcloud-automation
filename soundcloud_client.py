@@ -33,9 +33,9 @@ class SoundCloudClient:
         self.playlist_sharing = playlist_sharing if playlist_sharing in ("public", "private") else "private"
         self.on_token_refresh = on_token_refresh
         self._playlists_cache: Optional[List[Dict[str, Any]]] = None
+        self._token_expires_at: Optional[datetime.datetime] = None
 
-        # Connection pooling and automatic retries for transient 429/5xx errors
-        # H-3: Explicitly allow retries on POST for OAuth token refresh and notifications
+        # Connection pooling and automatic retries for SoundCloud API
         self.session = requests.Session()
         retries = Retry(
             total=3,
@@ -47,9 +47,16 @@ class SoundCloudClient:
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
 
+    def _token_is_fresh(self) -> bool:
+        if not self.access_token:
+            return False
+        if self._token_expires_at is None:
+            return True  # Externally supplied token: expiry unknown, rely on 401 reactive path
+        return datetime.datetime.now(datetime.timezone.utc) < self._token_expires_at
+
     def ensure_access_token(self, force_refresh: bool = False) -> str:
         """Obtains or refreshes the SoundCloud OAuth access token."""
-        if self.access_token and not force_refresh:
+        if self._token_is_fresh() and not force_refresh:
             return self.access_token
 
         if not self.refresh_token or not self.client_id or not self.client_secret:
@@ -70,6 +77,19 @@ class SoundCloudClient:
         data = response.json()
         self.access_token = data.get("access_token", "")
         
+        expires_in = data.get("expires_in")
+        if expires_in:
+            try:
+                self._token_expires_at = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=int(expires_in) - 60)
+                )
+            except (ValueError, TypeError):
+                self._token_expires_at = None
+                logger.warning("Unparseable expires_in from token endpoint: %r", expires_in)
+        else:
+            self._token_expires_at = None
+
         # Persist new refresh token if SoundCloud rotated it
         if "refresh_token" in data and data["refresh_token"] != self.refresh_token:
             self.refresh_token = data["refresh_token"]
@@ -167,11 +187,20 @@ class SoundCloudClient:
                 if is_wrapped and "created_at" in item:
                     created_at_str = item["created_at"]
                     try:
-                        dt_str = str(created_at_str).replace("/", "-").replace(" +0000", "+00:00")
-                        if dt_str.endswith("Z"):
-                            dt_str = dt_str[:-1] + "+00:00"
+                        liked_dt = None
+                        for fmt in ("%Y/%m/%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z"):
+                            try:
+                                liked_dt = datetime.datetime.strptime(str(created_at_str), fmt)
+                                break
+                            except ValueError:
+                                continue
+
+                        if liked_dt is None:
+                            dt_str = str(created_at_str).replace("/", "-").replace(" +0000", "+00:00")
+                            if dt_str.endswith("Z"):
+                                dt_str = dt_str[:-1] + "+00:00"
+                            liked_dt = datetime.datetime.fromisoformat(dt_str)
                         
-                        liked_dt = datetime.datetime.fromisoformat(dt_str)
                         if liked_dt.tzinfo is None:
                             liked_dt = liked_dt.replace(tzinfo=datetime.timezone.utc)
                         

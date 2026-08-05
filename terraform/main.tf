@@ -1,5 +1,8 @@
 terraform {
   required_version = ">= 1.3.0"
+
+  backend "gcs" {}
+
   required_providers {
     google = {
       source  = "hashicorp/google"
@@ -173,6 +176,20 @@ resource "google_cloud_run_v2_service" "default" {
 
     containers {
       image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.service_name}/app:latest"
+
+      ports {
+        container_port = 8080
+      }
+
+      startup_probe {
+        tcp_socket {
+          port = 8080
+        }
+        initial_delay_seconds = 5
+        timeout_seconds       = 3
+        period_seconds        = 5
+        failure_threshold     = 3
+      }
 
       resources {
         limits = {

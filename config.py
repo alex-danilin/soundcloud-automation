@@ -1,5 +1,7 @@
 import os
 import logging
+# python-dotenv is a DEV-ONLY dependency (see requirements-dev.in). Absent in the
+# production image by design — Cloud Run supplies configuration as env vars.
 try:
     from dotenv import load_dotenv
     load_dotenv()

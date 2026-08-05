@@ -1,0 +1,4 @@
+# Usage: terraform init -backend-config=backend.hcl
+# Replace with your GCP project ID's state bucket
+bucket = "YOUR_PROJECT_ID-tfstate"
+prefix = "soundcloud-bot"

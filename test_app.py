@@ -1,9 +1,12 @@
+import flask
 import unittest
 import datetime
 from unittest.mock import MagicMock, patch
 from soundcloud_client import SoundCloudClient
 from telegram_notifier import TelegramNotifier
 import state_manager
+
+_TEST_APP = flask.Flask(__name__)
 
 class TestSoundCloudClient(unittest.TestCase):
 
@@ -72,6 +75,22 @@ class TestSoundCloudClient(unittest.TestCase):
 
         track_ids = [t["id"] for t in tracks]
         self.assertEqual(track_ids, [100, 99])
+
+    def test_proactive_token_expiry_refresh(self):
+        client = SoundCloudClient(client_id="cid", client_secret="cs", refresh_token="rt", access_token="")
+        client._token_expires_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10)
+
+        with patch.object(client.session, "post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.ok = True
+            mock_resp.json.return_value = {"access_token": "new_at", "expires_in": 3600}
+            mock_post.return_value = mock_resp
+
+            token = client.ensure_access_token()
+            self.assertEqual(token, "new_at")
+            self.assertTrue(mock_post.called)
+            self.assertIsNotNone(client._token_expires_at)
+            self.assertTrue(client._token_is_fresh())
 
     @patch.object(SoundCloudClient, "_make_request")
     def test_playlist_authoritative_fetch_and_update(self, mock_make_request):
@@ -144,6 +163,27 @@ class TestSoundCloudClient(unittest.TestCase):
             self.assertEqual(len(saved_data["notified_track_ids"]), 500)
             self.assertEqual(saved_data["notified_track_ids"][0], 101)
             self.assertEqual(saved_data["notified_track_ids"][-1], 600)
+
+    def test_state_manager_not_found_returns_empty(self):
+        from google.api_core import exceptions as gcp_exceptions
+        mock_storage = MagicMock()
+        mock_blob = MagicMock()
+        mock_blob.download_as_bytes.side_effect = gcp_exceptions.NotFound("Object not found")
+        mock_storage.Client.return_value.bucket.return_value.blob.return_value = mock_blob
+
+        with patch.object(state_manager, "storage", mock_storage):
+            res = state_manager.load_state("test-bucket")
+            self.assertEqual(res, {})
+
+    def test_state_manager_corrupt_json_raises_runtime_error(self):
+        mock_storage = MagicMock()
+        mock_blob = MagicMock()
+        mock_blob.download_as_bytes.return_value = b"NOT_VALID_JSON"
+        mock_storage.Client.return_value.bucket.return_value.blob.return_value = mock_blob
+
+        with patch.object(state_manager, "storage", mock_storage):
+            with self.assertRaises(RuntimeError):
+                state_manager.load_state("test-bucket")
 
     @patch("main.Config")
     @patch("main.SoundCloudClient")
@@ -229,12 +269,12 @@ class TestSoundCloudClient(unittest.TestCase):
                 mock_tg.return_value = mock_tg_instance
                 mock_tg_instance.send_track_notification.return_value = tc["tg_status"]
 
-                from main import main, app
+                from main import main
                 mock_req = MagicMock()
                 mock_req.args = {}
                 mock_req.get_json.return_value = {}
 
-                with app.app_context():
+                with _TEST_APP.app_context():
                     resp_data, status_code = main(mock_req)
 
                 saved_state = mock_state_mgr.save_state.call_args[0][1]
